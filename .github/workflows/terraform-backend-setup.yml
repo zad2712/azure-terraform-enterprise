@@ -1,0 +1,537 @@
+#===============================================================================
+# Terraform Backend Setup and Management
+# 
+# This workflow sets up and manages the Azure Storage backend for Terraform
+# state files across all environments and layers.
+#===============================================================================
+
+name: 🗄️ Backend Setup
+
+on:
+  # Manual workflow dispatch for backend operations
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Backend action to perform'
+        required: true
+        type: choice
+        options:
+          - setup
+          - update-configs
+          - verify
+          - cleanup
+        default: setup
+      
+      environment:
+        description: 'Target environment (for cleanup only)'
+        required: false
+        type: choice
+        options:
+          - dev
+          - qa  
+          - uat
+          - prod
+          - all
+        default: all
+      
+      storage_account_name:
+        description: 'Storage account name (for setup/update)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  TF_VERSION: '1.6.0'
+  RESOURCE_GROUP_NAME: 'rg-terraform-state'
+  CONTAINER_NAME: 'tfstate'
+
+jobs:
+  #=============================================================================
+  # Setup Backend Infrastructure
+  #=============================================================================
+  setup-backend:
+    name: 🗄️ Setup Backend Storage
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'setup'
+    
+    outputs:
+      storage_account_name: ${{ steps.setup.outputs.storage_account_name }}
+      
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: 🗄️ Create Backend Infrastructure
+        id: setup
+        run: |
+          echo "🗄️ Setting up Terraform backend infrastructure..."
+          
+          # Get subscription info
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+          LOCATION="East US"  # Change as needed
+          
+          echo "📍 Subscription: $SUBSCRIPTION_ID"
+          echo "📍 Location: $LOCATION"
+          
+          # Generate unique storage account name if not provided
+          if [[ -n "${{ github.event.inputs.storage_account_name }}" ]]; then
+            STORAGE_ACCOUNT_NAME="${{ github.event.inputs.storage_account_name }}"
+          else
+            # Generate name: stterraform + 8 random chars (must be 3-24 chars, lowercase, numbers only)
+            RANDOM_SUFFIX=$(openssl rand -hex 4)
+            STORAGE_ACCOUNT_NAME="stterraform${RANDOM_SUFFIX}"
+          fi
+          
+          echo "🗄️ Storage Account: $STORAGE_ACCOUNT_NAME"
+          echo "storage_account_name=$STORAGE_ACCOUNT_NAME" >> $GITHUB_OUTPUT
+          
+          # Create resource group
+          echo "📦 Creating resource group..."
+          az group create \
+            --name "$RESOURCE_GROUP_NAME" \
+            --location "$LOCATION" \
+            --tags \
+              Environment="shared" \
+              Purpose="terraform-state" \
+              ManagedBy="github-actions" \
+              Repository="${{ github.repository }}"
+          
+          # Create storage account
+          echo "🗄️ Creating storage account..."
+          az storage account create \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --name "$STORAGE_ACCOUNT_NAME" \
+            --sku "Standard_LRS" \
+            --kind "StorageV2" \
+            --location "$LOCATION" \
+            --encryption-services blob \
+            --encryption-services file \
+            --https-only true \
+            --min-tls-version "TLS1_2" \
+            --allow-blob-public-access false \
+            --tags \
+              Environment="shared" \
+              Purpose="terraform-state" \
+              ManagedBy="github-actions" \
+              Repository="${{ github.repository }}"
+          
+          # Enable versioning
+          echo "📝 Enabling blob versioning..."
+          az storage account blob-service-properties update \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --enable-versioning true \
+            --enable-change-feed true
+          
+          # Create storage container
+          echo "📦 Creating storage container..."
+          az storage container create \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --name "$CONTAINER_NAME" \
+            --public-access off \
+            --auth-mode login
+          
+          # Set up lifecycle management
+          echo "♻️ Setting up lifecycle management..."
+          cat > lifecycle-policy.json << 'EOF'
+          {
+            "rules": [
+              {
+                "enabled": true,
+                "name": "DeleteOldVersions",
+                "type": "Lifecycle",
+                "definition": {
+                  "actions": {
+                    "version": {
+                      "delete": {
+                        "daysAfterCreationGreaterThan": 90
+                      }
+                    }
+                  },
+                  "filters": {
+                    "blobTypes": ["blockBlob"]
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          
+          az storage account management-policy create \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --policy @lifecycle-policy.json
+          
+          echo "✅ Backend infrastructure created successfully!"
+          echo ""
+          echo "📋 Summary:"
+          echo "  Resource Group: $RESOURCE_GROUP_NAME"
+          echo "  Storage Account: $STORAGE_ACCOUNT_NAME"
+          echo "  Container: $CONTAINER_NAME"
+          echo "  Location: $LOCATION"
+      
+      - name: 🔒 Configure Access Permissions
+        run: |
+          echo "🔒 Configuring access permissions..."
+          
+          STORAGE_ACCOUNT_NAME="${{ steps.setup.outputs.storage_account_name }}"
+          
+          # Get current user/service principal
+          CURRENT_USER=$(az account show --query user.name -o tsv)
+          echo "👤 Current user: $CURRENT_USER"
+          
+          # Assign Storage Blob Data Contributor role to current user/SP
+          az role assignment create \
+            --role "Storage Blob Data Contributor" \
+            --assignee "$CURRENT_USER" \
+            --scope "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP_NAME/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT_NAME"
+          
+          echo "✅ Permissions configured successfully!"
+      
+      - name: 📄 Display Setup Instructions
+        run: |
+          STORAGE_ACCOUNT_NAME="${{ steps.setup.outputs.storage_account_name }}"
+          
+          echo "## 🗄️ Backend Setup Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your Terraform backend infrastructure has been created successfully." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Configuration Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resource Group**: \`$RESOURCE_GROUP_NAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Storage Account**: \`$STORAGE_ACCOUNT_NAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container**: \`$CONTAINER_NAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run the **update-configs** action to update all backend.conf files" >> $GITHUB_STEP_SUMMARY
+          echo "2. Commit the updated backend configurations" >> $GITHUB_STEP_SUMMARY
+          echo "3. Initialize Terraform in each layer with the new backend" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔑 Required Secrets" >> $GITHUB_STEP_SUMMARY
+          echo "Ensure these secrets are configured in your repository:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`AZURE_CREDENTIALS\` (Service Principal with Storage access)" >> $GITHUB_STEP_SUMMARY
+
+  #=============================================================================
+  # Update Backend Configuration Files
+  #=============================================================================
+  update-configs:
+    name: 📝 Update Backend Configs
+    runs-on: ubuntu-latest
+    needs: setup-backend
+    if: always() && (github.event.inputs.action == 'setup' || github.event.inputs.action == 'update-configs')
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 📝 Update Backend Configuration Files
+        run: |
+          echo "📝 Updating backend configuration files..."
+          
+          # Get storage account name
+          if [[ -n "${{ needs.setup-backend.outputs.storage_account_name }}" ]]; then
+            STORAGE_ACCOUNT_NAME="${{ needs.setup-backend.outputs.storage_account_name }}"
+          elif [[ -n "${{ github.event.inputs.storage_account_name }}" ]]; then
+            STORAGE_ACCOUNT_NAME="${{ github.event.inputs.storage_account_name }}"
+          else
+            echo "❌ Storage account name not provided"
+            exit 1
+          fi
+          
+          echo "🗄️ Using storage account: $STORAGE_ACCOUNT_NAME"
+          
+          # Update all backend.conf files
+          UPDATED_FILES=()
+          
+          for backend_conf in layers/*/environments/*/backend.conf; do
+            if [[ -f "$backend_conf" ]]; then
+              echo "📝 Updating: $backend_conf"
+              
+              # Replace placeholder with actual storage account name
+              sed -i "s/<STORAGE_ACCOUNT_NAME>/$STORAGE_ACCOUNT_NAME/g" "$backend_conf"
+              
+              # Verify the update
+              if grep -q "$STORAGE_ACCOUNT_NAME" "$backend_conf"; then
+                UPDATED_FILES+=("$backend_conf")
+                echo "  ✅ Updated successfully"
+              else
+                echo "  ⚠️ No changes made (already configured?)"
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "📋 Updated ${#UPDATED_FILES[@]} backend configuration files:"
+          for file in "${UPDATED_FILES[@]}"; do
+            echo "  - $file"
+          done
+      
+      - name: 📄 Create Summary of Changes
+        run: |
+          echo "## 📝 Backend Configuration Update" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Updated backend configuration files with storage account details." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Changed Files" >> $GITHUB_STEP_SUMMARY
+          
+          # Show changed files
+          for backend_conf in layers/*/environments/*/backend.conf; do
+            if [[ -f "$backend_conf" ]]; then
+              echo "- \`$backend_conf\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review the changes below" >> $GITHUB_STEP_SUMMARY
+          echo "2. Commit and push the updated configuration files" >> $GITHUB_STEP_SUMMARY
+          echo "3. Run terraform init in each layer to migrate to the new backend" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 🔍 Show Sample Configuration
+        run: |
+          echo "📄 Sample backend configuration:"
+          echo ""
+          if [[ -f "layers/networking/environments/dev/backend.conf" ]]; then
+            echo "Content of layers/networking/environments/dev/backend.conf:"
+            cat layers/networking/environments/dev/backend.conf
+          fi
+      
+      - name: 💾 Commit Changes (if auto-commit enabled)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Only commit if there are changes and auto-commit is desired
+          if git diff --quiet; then
+            echo "📄 No changes to commit"
+          else
+            echo "💾 Changes detected, creating commit..."
+            
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            
+            git add layers/*/environments/*/backend.conf
+            git commit -m "🗄️ Update Terraform backend configurations
+            
+            - Updated storage account name in all backend.conf files
+            - Storage account: ${STORAGE_ACCOUNT_NAME:-${{ github.event.inputs.storage_account_name }}}
+            - Updated by: GitHub Actions
+            - Workflow: ${{ github.workflow }}
+            - Run ID: ${{ github.run_id }}"
+            
+            echo "📤 Pushing changes..."
+            git push
+            
+            echo "✅ Backend configurations committed and pushed successfully!"
+          fi
+
+  #=============================================================================
+  # Verify Backend Configuration
+  #=============================================================================
+  verify-backend:
+    name: ✅ Verify Backend
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'verify'
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: ✅ Verify Backend Connectivity
+        run: |
+          echo "✅ Verifying backend connectivity for all environments..."
+          
+          VERIFICATION_RESULTS=()
+          TOTAL_TESTS=0
+          SUCCESSFUL_TESTS=0
+          
+          for layer in layers/*/; do
+            layer_name=$(basename "$layer")
+            
+            for env_dir in "$layer"environments/*/; do
+              if [[ -d "$env_dir" ]]; then
+                env_name=$(basename "$env_dir")
+                TOTAL_TESTS=$((TOTAL_TESTS + 1))
+                
+                echo ""
+                echo "🔍 Testing: $layer_name/$env_name"
+                
+                cd "$layer"
+                
+                if [[ -f "environments/$env_name/backend.conf" ]]; then
+                  # Test initialization
+                  if terraform init -backend-config="environments/$env_name/backend.conf" > /dev/null 2>&1; then
+                    VERIFICATION_RESULTS+=("✅ $layer_name/$env_name: Backend accessible")
+                    SUCCESSFUL_TESTS=$((SUCCESSFUL_TESTS + 1))
+                    echo "  ✅ Backend accessible"
+                  else
+                    VERIFICATION_RESULTS+=("❌ $layer_name/$env_name: Backend inaccessible")
+                    echo "  ❌ Backend inaccessible"
+                  fi
+                  
+                  # Cleanup
+                  rm -rf .terraform/ .terraform.lock.hcl 2>/dev/null || true
+                else
+                  VERIFICATION_RESULTS+=("⚠️ $layer_name/$env_name: No backend config")
+                  echo "  ⚠️ No backend configuration found"
+                fi
+                
+                cd - > /dev/null
+              fi
+            done
+          done
+          
+          echo ""
+          echo "📋 Verification Summary:"
+          echo "  Total tests: $TOTAL_TESTS"
+          echo "  Successful: $SUCCESSFUL_TESTS"
+          echo "  Failed: $((TOTAL_TESTS - SUCCESSFUL_TESTS))"
+          echo ""
+          
+          for result in "${VERIFICATION_RESULTS[@]}"; do
+            echo "$result"
+          done
+          
+          # Create summary
+          echo "## ✅ Backend Verification Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Configurations Tested**: $TOTAL_TESTS" >> $GITHUB_STEP_SUMMARY
+          echo "**Successful Connections**: $SUCCESSFUL_TESTS" >> $GITHUB_STEP_SUMMARY
+          echo "**Failed Connections**: $((TOTAL_TESTS - SUCCESSFUL_TESTS))" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Detailed Results" >> $GITHUB_STEP_SUMMARY
+          
+          for result in "${VERIFICATION_RESULTS[@]}"; do
+            echo "- $result" >> $GITHUB_STEP_SUMMARY
+          done
+
+  #=============================================================================
+  # Cleanup Backend (use with caution!)
+  #=============================================================================
+  cleanup-backend:
+    name: 🧹 Cleanup Backend
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'cleanup'
+
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: ⚠️ Cleanup Warning
+        run: |
+          echo "⚠️ WARNING: BACKEND CLEANUP OPERATION"
+          echo ""
+          echo "This operation will clean up Terraform state files!"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo ""
+          echo "⚠️ THIS IS POTENTIALLY DESTRUCTIVE!"
+          echo "State files will be backed up before cleanup."
+          echo ""
+          echo "Proceeding in 30 seconds..."
+          sleep 30
+      
+      - name: 💾 Backup State Files
+        run: |
+          echo "💾 Creating backup of state files..."
+          
+          BACKUP_DIR="state-backup-$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "$BACKUP_DIR"
+          
+          # List and backup existing state files
+          STORAGE_ACCOUNTS=$(az storage account list --resource-group "$RESOURCE_GROUP_NAME" --query "[].name" -o tsv 2>/dev/null || echo "")
+          
+          if [[ -n "$STORAGE_ACCOUNTS" ]]; then
+            for storage_account in $STORAGE_ACCOUNTS; do
+              echo "📄 Backing up state from: $storage_account"
+              
+              # List blobs and download
+              az storage blob list \
+                --account-name "$storage_account" \
+                --container-name "$CONTAINER_NAME" \
+                --query "[].name" -o tsv \
+                --auth-mode login > /tmp/blob-list.txt 2>/dev/null || continue
+              
+              while read -r blob_name; do
+                if [[ -n "$blob_name" ]]; then
+                  az storage blob download \
+                    --account-name "$storage_account" \
+                    --container-name "$CONTAINER_NAME" \
+                    --name "$blob_name" \
+                    --file "$BACKUP_DIR/$blob_name" \
+                    --auth-mode login || true
+                fi
+              done < /tmp/blob-list.txt
+            done
+          fi
+          
+          echo "💾 Backup completed in: $BACKUP_DIR"
+      
+      - name: 🧹 Perform Cleanup
+        run: |
+          echo "🧹 Performing backend cleanup..."
+          
+          if [[ "${{ github.event.inputs.environment }}" == "all" ]]; then
+            echo "🗑️ Cleaning up ALL state files"
+            
+            # This is the nuclear option - use with extreme caution
+            echo "⚠️ This would delete ALL Terraform state files!"
+            echo "Aborting for safety. Use specific environment instead."
+            exit 1
+            
+          else
+            ENV="${{ github.event.inputs.environment }}"
+            echo "🗑️ Cleaning up state files for environment: $ENV"
+            
+            # Find storage accounts
+            STORAGE_ACCOUNTS=$(az storage account list --resource-group "$RESOURCE_GROUP_NAME" --query "[].name" -o tsv 2>/dev/null || echo "")
+            
+            for storage_account in $STORAGE_ACCOUNTS; do
+              # Delete specific environment state files
+              az storage blob list \
+                --account-name "$storage_account" \
+                --container-name "$CONTAINER_NAME" \
+                --query "[?contains(name, '$ENV')].name" -o tsv \
+                --auth-mode login | \
+              while read -r blob_name; do
+                if [[ -n "$blob_name" ]]; then
+                  echo "🗑️ Deleting: $blob_name"
+                  az storage blob delete \
+                    --account-name "$storage_account" \
+                    --container-name "$CONTAINER_NAME" \
+                    --name "$blob_name" \
+                    --auth-mode login || true
+                fi
+              done
+            done
+          fi
+          
+          echo "✅ Cleanup completed!"
+      
+      - name: 💾 Upload Backup
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-state-backup-${{ github.event.inputs.environment }}
+          path: state-backup-*
+          retention-days: 90

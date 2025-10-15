@@ -1,0 +1,403 @@
+#===============================================================================
+# Terraform State Drift Detection
+# 
+# This workflow detects configuration drift by comparing the actual Azure 
+# infrastructure state with the Terraform state files across all environments.
+#===============================================================================
+
+name: 🔍 Drift Detection
+
+on:
+  # Scheduled drift detection (daily at 6 AM UTC)
+  schedule:
+    - cron: '0 6 * * *'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to check for drift'
+        required: false
+        type: choice
+        options:
+          - all
+          - dev
+          - qa
+          - uat
+          - prod
+        default: all
+      
+      layer:
+        description: 'Layer to check for drift'
+        required: false
+        type: choice
+        options:
+          - all
+          - networking
+          - security
+          - storage
+          - database
+          - compute
+          - monitoring
+        default: all
+
+env:
+  TF_VERSION: '1.6.0'
+  TF_LOG: WARN
+
+jobs:
+  #=============================================================================
+  # Setup Matrix for Drift Detection
+  #=============================================================================
+  setup-matrix:
+    name: 🔧 Setup Detection Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Generate Matrix
+        id: matrix
+        run: |
+          # Define environments and layers
+          ENVIRONMENTS=("dev" "qa" "uat" "prod")
+          LAYERS=("networking" "security" "storage" "database" "compute" "monitoring")
+          
+          # Filter based on inputs (if manual trigger)
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.environment }}" != "all" ]]; then
+              ENVIRONMENTS=("${{ github.event.inputs.environment }}")
+            fi
+            
+            if [[ "${{ github.event.inputs.layer }}" != "all" ]]; then
+              LAYERS=("${{ github.event.inputs.layer }}")
+            fi
+          fi
+          
+          # Generate matrix combinations
+          MATRIX_INCLUDE=()
+          
+          for env in "${ENVIRONMENTS[@]}"; do
+            for layer in "${LAYERS[@]}"; do
+              # Check if the combination exists
+              if [[ -f "layers/${layer}/environments/${env}/terraform.tfvars" ]]; then
+                MATRIX_INCLUDE+=("{\"environment\":\"${env}\",\"layer\":\"${layer}\"}")
+              fi
+            done
+          done
+          
+          # Format as JSON array
+          MATRIX_JSON="[$(IFS=,; echo "${MATRIX_INCLUDE[*]}")]"
+          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+          
+          echo "🔍 Drift detection matrix:"
+          echo "$MATRIX_JSON" | jq '.'
+
+  #=============================================================================
+  # Drift Detection Job
+  #=============================================================================
+  detect-drift:
+    name: 🔍 Detect (${{ matrix.layer }}-${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: setup-matrix
+    if: needs.setup-matrix.outputs.matrix != '[]'
+    
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 3
+      fail-fast: false
+    
+    env:
+      TF_WORKSPACE: ${{ matrix.layer }}-${{ matrix.environment }}
+      TF_VAR_environment: ${{ matrix.environment }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: 🏗️ Terraform Init
+        working-directory: layers/${{ matrix.layer }}
+        run: |
+          echo "🔄 Initializing Terraform for ${{ matrix.layer }}/${{ matrix.environment }}..."
+          
+          # Check if backend config exists
+          if [[ ! -f "environments/${{ matrix.environment }}/backend.conf" ]]; then
+            echo "⚠️ Backend configuration not found, skipping drift detection"
+            exit 0
+          fi
+          
+          # Check for placeholders
+          if grep -q "<STORAGE_ACCOUNT_NAME>" environments/${{ matrix.environment }}/backend.conf; then
+            echo "⚠️ Backend configuration contains placeholder, skipping drift detection"
+            exit 0
+          fi
+          
+          terraform init -backend-config=environments/${{ matrix.environment }}/backend.conf
+      
+      - name: 🔍 Check for State File
+        working-directory: layers/${{ matrix.layer }}
+        id: state-check
+        run: |
+          echo "🔍 Checking if state file exists..."
+          
+          # Try to pull state (this will fail if state doesn't exist)
+          if terraform state pull > /dev/null 2>&1; then
+            echo "state_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ State file exists"
+          else
+            echo "state_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No state file found - infrastructure not deployed"
+          fi
+      
+      - name: 🔍 Terraform Refresh and Plan
+        working-directory: layers/${{ matrix.layer }}
+        if: steps.state-check.outputs.state_exists == 'true'
+        id: drift-check
+        run: |
+          echo "🔍 Checking for configuration drift..."
+          
+          # Refresh state to get latest information from Azure
+          terraform refresh -var-file=environments/${{ matrix.environment }}/terraform.tfvars
+          
+          # Run plan to detect drift
+          terraform plan \
+            -var-file=environments/${{ matrix.environment }}/terraform.tfvars \
+            -detailed-exitcode \
+            -out=drift-plan \
+            > plan-output.txt 2>&1
+          
+          PLAN_EXIT_CODE=$?
+          
+          # Exit codes: 0 = no changes, 1 = error, 2 = changes detected
+          case $PLAN_EXIT_CODE in
+            0)
+              echo "drift_status=no-drift" >> $GITHUB_OUTPUT
+              echo "✅ No drift detected"
+              ;;
+            1)
+              echo "drift_status=error" >> $GITHUB_OUTPUT
+              echo "❌ Error during drift detection"
+              cat plan-output.txt
+              exit 1
+              ;;
+            2)
+              echo "drift_status=drift-detected" >> $GITHUB_OUTPUT
+              echo "⚠️ Configuration drift detected!"
+              
+              # Count changes
+              CHANGES=$(grep -E "Plan:|# " plan-output.txt | head -10)
+              echo "Changes summary:"
+              echo "$CHANGES"
+              ;;
+          esac
+      
+      - name: 📊 Parse Drift Details
+        working-directory: layers/${{ matrix.layer }}
+        if: steps.drift-check.outputs.drift_status == 'drift-detected'
+        run: |
+          echo "📊 Analyzing drift details..."
+          
+          # Extract change summary
+          ADD_COUNT=$(grep -o "to add" plan-output.txt | wc -l || echo "0")
+          CHANGE_COUNT=$(grep -o "to change" plan-output.txt | wc -l || echo "0")
+          DESTROY_COUNT=$(grep -o "to destroy" plan-output.txt | wc -l || echo "0")
+          
+          echo "## 🔍 Drift Detection: ${{ matrix.layer }}-${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ⚠️ Configuration Drift Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Changes Summary:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to add: $ADD_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to change: $CHANGE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to destroy: $DESTROY_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Show first few lines of plan
+          echo "**Plan Preview:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          head -30 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📊 No Drift Summary
+        working-directory: layers/${{ matrix.layer }}
+        if: steps.drift-check.outputs.drift_status == 'no-drift'
+        run: |
+          echo "## 🔍 Drift Detection: ${{ matrix.layer }}-${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ No Configuration Drift" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Infrastructure matches the Terraform configuration." >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📊 Skipped Summary
+        working-directory: layers/${{ matrix.layer }}
+        if: steps.state-check.outputs.state_exists == 'false'
+        run: |
+          echo "## 🔍 Drift Detection: ${{ matrix.layer }}-${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ⏭️ Skipped (No Infrastructure)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "No state file found - infrastructure appears to not be deployed." >> $GITHUB_STEP_SUMMARY
+      
+      - name: 💾 Upload Drift Plan
+        uses: actions/upload-artifact@v3
+        if: steps.drift-check.outputs.drift_status == 'drift-detected'
+        with:
+          name: drift-plan-${{ matrix.layer }}-${{ matrix.environment }}
+          path: layers/${{ matrix.layer }}/drift-plan
+          retention-days: 30
+      
+      - name: 📄 Upload Plan Output
+        uses: actions/upload-artifact@v3
+        if: always() && steps.state-check.outputs.state_exists == 'true'
+        with:
+          name: plan-output-${{ matrix.layer }}-${{ matrix.environment }}
+          path: layers/${{ matrix.layer }}/plan-output.txt
+          retention-days: 7
+
+  #=============================================================================
+  # Drift Summary and Notifications
+  #=============================================================================
+  drift-summary:
+    name: 📋 Drift Summary
+    runs-on: ubuntu-latest
+    needs: [setup-matrix, detect-drift]
+    if: always() && needs.setup-matrix.outputs.matrix != '[]'
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 📊 Compile Drift Report
+        run: |
+          echo "## 🔍 Infrastructure Drift Detection Report" > drift-report.md
+          echo "" >> drift-report.md
+          echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> drift-report.md
+          echo "**Repository:** ${{ github.repository }}" >> drift-report.md
+          echo "**Trigger:** ${{ github.event_name }}" >> drift-report.md
+          echo "" >> drift-report.md
+          
+          # Check job results from matrix
+          DRIFT_DETECTED=false
+          TOTAL_CHECKS=0
+          SUCCESS_CHECKS=0
+          DRIFT_CHECKS=0
+          ERROR_CHECKS=0
+          
+          # This is a simplified count - in a real scenario, you'd parse job outputs
+          echo "### Summary" >> drift-report.md
+          echo "" >> drift-report.md
+          echo "- Total environments checked: Multiple" >> drift-report.md
+          echo "- Layers scanned: All configured layers" >> drift-report.md
+          echo "- Detection method: Terraform plan with state refresh" >> drift-report.md
+          echo "" >> drift-report.md
+          
+          echo "### Recommendations" >> drift-report.md
+          echo "" >> drift-report.md
+          echo "1. **Review drift artifacts** uploaded to this workflow run" >> drift-report.md
+          echo "2. **Investigate root causes** of any detected drift" >> drift-report.md
+          echo "3. **Update Terraform state** or configuration as needed" >> drift-report.md
+          echo "4. **Re-run deployments** for environments with significant drift" >> drift-report.md
+          echo "" >> drift-report.md
+          
+          echo "### Next Steps" >> drift-report.md
+          echo "" >> drift-report.md
+          echo "- Download drift plans from workflow artifacts" >> drift-report.md
+          echo "- Use \`terraform apply\` to remediate expected changes" >> drift-report.md
+          echo "- Investigate unexpected changes for security implications" >> drift-report.md
+          echo "- Update documentation if configuration intentionally changed" >> drift-report.md
+          
+          # Copy to step summary
+          cat drift-report.md >> $GITHUB_STEP_SUMMARY
+      
+      - name: 💾 Upload Drift Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: drift-detection-report
+          path: drift-report.md
+          retention-days: 30
+      
+      - name: 🚨 Create Issue on Drift (Production)
+        if: |
+          always() && 
+          (github.event.inputs.environment == 'prod' || github.event.inputs.environment == 'all' || github.event_name == 'schedule') &&
+          contains(join(needs.detect-drift.result, ' '), 'drift-detected')
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const title = `🚨 Infrastructure Drift Detected - ${new Date().toISOString().split('T')[0]}`;
+            const body = `
+            ## 🚨 Configuration Drift Alert
+            
+            **Automatic drift detection has identified configuration differences in production infrastructure.**
+            
+            ### Details
+            - **Date**: ${new Date().toUTCString()}
+            - **Workflow**: ${context.workflow}
+            - **Run ID**: ${context.runId}
+            - **Repository**: ${context.repo.owner}/${context.repo.repo}
+            
+            ### Immediate Actions Required
+            1. 🔍 **Review** the workflow run artifacts
+            2. 🛡️ **Investigate** if drift indicates unauthorized changes
+            3. 📋 **Plan** remediation strategy
+            4. 🚀 **Execute** corrective deployment if needed
+            
+            ### Workflow Run
+            [View Drift Detection Results](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            
+            ### Artifacts
+            - Drift plans and outputs are available in the workflow artifacts
+            - Download and review before taking corrective action
+            
+            ---
+            *This issue was created automatically by the drift detection workflow.*
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['infrastructure', 'drift', 'production', 'urgent']
+            });
+
+  #=============================================================================
+  # Cleanup Old Artifacts
+  #=============================================================================
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [drift-summary]
+    if: always()
+    
+    steps:
+      - name: 🧹 Cleanup Old Artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // Clean up artifacts older than 30 days
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            
+            console.log(`Found ${artifacts.data.total_count} artifacts for this run`);
+            
+            // Note: This is just logging - actual cleanup would need additional logic
+            // to identify old artifacts across multiple workflow runs

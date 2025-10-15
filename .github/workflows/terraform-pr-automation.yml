@@ -1,0 +1,474 @@
+#===============================================================================
+# Pull Request Automation for Terraform
+# 
+# This workflow automatically runs Terraform plans on pull requests and provides
+# detailed feedback on proposed infrastructure changes.
+#===============================================================================
+
+name: 🔄 PR Automation
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'layers/**'
+      - 'modules/**'
+      - '.github/workflows/**'
+  
+  pull_request_review:
+    types: [submitted]
+
+env:
+  TF_VERSION: '1.6.0'
+  TF_LOG: INFO
+
+jobs:
+  #=============================================================================
+  # Detect Changed Components
+  #=============================================================================
+  detect-changes:
+    name: 🔍 Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      changed_layers: ${{ steps.changes.outputs.changed_layers }}
+      changed_modules: ${{ steps.changes.outputs.changed_modules }}
+      has_infrastructure_changes: ${{ steps.changes.outputs.has_infrastructure_changes }}
+      deployment_plan: ${{ steps.changes.outputs.deployment_plan }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🔍 Analyze Changes
+        id: changes
+        run: |
+          echo "🔍 Analyzing changes in pull request..."
+          
+          # Get changed files between base and head
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.sha }})
+          
+          echo "📄 Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Initialize arrays
+          CHANGED_LAYERS=()
+          CHANGED_MODULES=()
+          HAS_INFRA_CHANGES=false
+          
+          # Analyze changed files
+          while IFS= read -r file; do
+            # Check for layer changes
+            if [[ $file == layers/* ]]; then
+              layer=$(echo "$file" | cut -d'/' -f2)
+              if [[ ! " ${CHANGED_LAYERS[@]} " =~ " ${layer} " ]]; then
+                CHANGED_LAYERS+=("\"$layer\"")
+              fi
+              HAS_INFRA_CHANGES=true
+            fi
+            
+            # Check for module changes
+            if [[ $file == modules/* ]]; then
+              module=$(echo "$file" | cut -d'/' -f2)
+              if [[ ! " ${CHANGED_MODULES[@]} " =~ " ${module} " ]]; then
+                CHANGED_MODULES+=("\"$module\"")
+              fi
+              HAS_INFRA_CHANGES=true
+            fi
+            
+            # Check for workflow changes
+            if [[ $file == .github/workflows/* ]]; then
+              echo "🔧 Workflow changes detected"
+            fi
+          done <<< "$CHANGED_FILES"
+          
+          # If modules changed, all layers are potentially affected
+          if [[ ${#CHANGED_MODULES[@]} -gt 0 ]]; then
+            CHANGED_LAYERS=("\"networking\"" "\"security\"" "\"storage\"" "\"database\"" "\"compute\"" "\"monitoring\"")
+          fi
+          
+          # Convert to JSON arrays
+          CHANGED_LAYERS_JSON="[$(IFS=,; echo "${CHANGED_LAYERS[*]}")]"
+          CHANGED_MODULES_JSON="[$(IFS=,; echo "${CHANGED_MODULES[*]}")]"
+          
+          echo "changed_layers=${CHANGED_LAYERS_JSON}" >> $GITHUB_OUTPUT
+          echo "changed_modules=${CHANGED_MODULES_JSON}" >> $GITHUB_OUTPUT
+          echo "has_infrastructure_changes=${HAS_INFRA_CHANGES}" >> $GITHUB_OUTPUT
+          
+          # Create deployment plan
+          DEPLOYMENT_PLAN='{"include":[]}'
+          if [[ ${#CHANGED_LAYERS[@]} -gt 0 ]]; then
+            DEPLOYMENT_PLAN=$(echo "$CHANGED_LAYERS_JSON" | jq '{include: [.[] | {layer: ., environment: "dev"}]}')
+          fi
+          echo "deployment_plan=${DEPLOYMENT_PLAN}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "🎯 Analysis Results:"
+          echo "  Changed Layers: ${CHANGED_LAYERS_JSON}"
+          echo "  Changed Modules: ${CHANGED_MODULES_JSON}"
+          echo "  Has Infrastructure Changes: ${HAS_INFRA_CHANGES}"
+
+  #=============================================================================
+  # Terraform Plan for Changed Components
+  #=============================================================================
+  terraform-plan:
+    name: 📋 Plan (${{ matrix.layer }})
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_infrastructure_changes == 'true'
+    
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.deployment_plan) }}
+      fail-fast: false
+    
+    env:
+      TF_WORKSPACE: ${{ matrix.layer }}-${{ matrix.environment }}
+      TF_VAR_environment: ${{ matrix.environment }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+        continue-on-error: true
+      
+      - name: 🏗️ Terraform Init
+        working-directory: layers/${{ matrix.layer }}
+        run: |
+          echo "🔄 Initializing Terraform for ${{ matrix.layer }}/${{ matrix.environment }}..."
+          
+          # Check if backend config exists
+          if [[ ! -f "environments/${{ matrix.environment }}/backend.conf" ]]; then
+            echo "⚠️ Backend configuration not found: environments/${{ matrix.environment }}/backend.conf"
+            echo "Initializing without backend for validation only..."
+            terraform init -backend=false
+          else
+            # Check for placeholders
+            if grep -q "<STORAGE_ACCOUNT_NAME>" environments/${{ matrix.environment }}/backend.conf; then
+              echo "⚠️ Backend configuration contains placeholder"
+              echo "Initializing without backend for validation only..."
+              terraform init -backend=false
+            else
+              terraform init -backend-config=environments/${{ matrix.environment }}/backend.conf
+            fi
+          fi
+      
+      - name: 🔍 Terraform Validate
+        working-directory: layers/${{ matrix.layer }}
+        run: |
+          echo "✅ Validating Terraform configuration..."
+          terraform validate
+      
+      - name: 📋 Terraform Plan
+        working-directory: layers/${{ matrix.layer }}
+        id: plan
+        run: |
+          echo "📋 Creating Terraform plan for ${{ matrix.layer }}/${{ matrix.environment }}..."
+          
+          # Check if tfvars file exists
+          if [[ ! -f "environments/${{ matrix.environment }}/terraform.tfvars" ]]; then
+            echo "⚠️ Variables file not found: environments/${{ matrix.environment }}/terraform.tfvars"
+            echo "plan_status=no-vars" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Create plan
+          if terraform plan \
+            -var-file=environments/${{ matrix.environment }}/terraform.tfvars \
+            -out=tfplan-pr-${{ github.event.number }} \
+            -detailed-exitcode \
+            > plan-output.txt 2>&1; then
+            echo "plan_status=success" >> $GITHUB_OUTPUT
+          else
+            PLAN_EXIT_CODE=$?
+            if [[ $PLAN_EXIT_CODE -eq 2 ]]; then
+              echo "plan_status=changes" >> $GITHUB_OUTPUT
+            else
+              echo "plan_status=error" >> $GITHUB_OUTPUT
+              echo "❌ Plan failed with exit code: $PLAN_EXIT_CODE"
+              cat plan-output.txt
+            fi
+          fi
+        continue-on-error: true
+      
+      - name: 📊 Format Plan Output
+        working-directory: layers/${{ matrix.layer }}
+        if: steps.plan.outputs.plan_status != 'no-vars'
+        run: |
+          echo "📊 Formatting plan output..."
+          
+          # Create formatted output for PR comment
+          {
+            echo "## 📋 Terraform Plan: ${{ matrix.layer }}"
+            echo ""
+            echo "**Environment:** ${{ matrix.environment }}"
+            echo "**Status:** ${{ steps.plan.outputs.plan_status }}"
+            echo ""
+            
+            if [[ "${{ steps.plan.outputs.plan_status }}" == "changes" ]]; then
+              echo "### 📈 Changes Summary"
+              
+              # Extract change counts
+              ADD_COUNT=$(grep -o "to add" plan-output.txt | wc -l || echo "0")
+              CHANGE_COUNT=$(grep -o "to change" plan-output.txt | wc -l || echo "0")
+              DESTROY_COUNT=$(grep -o "to destroy" plan-output.txt | wc -l || echo "0")
+              
+              echo "- **To Add:** $ADD_COUNT resources"
+              echo "- **To Change:** $CHANGE_COUNT resources"  
+              echo "- **To Destroy:** $DESTROY_COUNT resources"
+              echo ""
+              
+              echo "<details>"
+              echo "<summary>📋 View Plan Details</summary>"
+              echo ""
+              echo "\`\`\`hcl"
+              terraform show -no-color tfplan-pr-${{ github.event.number }} | head -100
+              echo "\`\`\`"
+              echo ""
+              echo "</details>"
+              
+            elif [[ "${{ steps.plan.outputs.plan_status }}" == "success" ]]; then
+              echo "✅ **No infrastructure changes detected**"
+              
+            elif [[ "${{ steps.plan.outputs.plan_status }}" == "error" ]]; then
+              echo "❌ **Plan failed**"
+              echo ""
+              echo "<details>"
+              echo "<summary>📄 View Error Details</summary>"
+              echo ""
+              echo "\`\`\`"
+              head -50 plan-output.txt
+              echo "\`\`\`"
+              echo ""
+              echo "</details>"
+            fi
+            
+            echo ""
+            echo "---"
+            echo "*Generated by PR #${{ github.event.number }} • Commit: ${{ github.sha }}*"
+          } > plan-comment-${{ matrix.layer }}.md
+      
+      - name: 💾 Upload Plan Output
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: plan-${{ matrix.layer }}-${{ matrix.environment }}-pr${{ github.event.number }}
+          path: |
+            layers/${{ matrix.layer }}/plan-output.txt
+            layers/${{ matrix.layer }}/plan-comment-${{ matrix.layer }}.md
+            layers/${{ matrix.layer }}/tfplan-pr-${{ github.event.number }}
+          retention-days: 30
+
+  #=============================================================================
+  # Update PR with Plan Results
+  #=============================================================================
+  update-pr:
+    name: 💬 Update PR
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform-plan]
+    if: always() && needs.detect-changes.outputs.has_infrastructure_changes == 'true'
+    
+    steps:
+      - name: 📥 Download Plan Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: plan-artifacts
+      
+      - name: 💬 Create or Update PR Comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Collect all plan comments
+            let fullComment = `## 🔄 Terraform Plan Results\n\n`;
+            fullComment += `**Pull Request:** #${{ github.event.number }}\n`;
+            fullComment += `**Triggered by:** @${{ github.actor }}\n`;
+            fullComment += `**Commit:** ${{ github.sha }}\n\n`;
+            
+            // Read plan outputs
+            const artifactDir = 'plan-artifacts';
+            let hasChanges = false;
+            let hasErrors = false;
+            
+            try {
+              const artifacts = fs.readdirSync(artifactDir);
+              
+              for (const artifact of artifacts) {
+                const commentFile = path.join(artifactDir, artifact, `plan-comment-${artifact.split('-')[1]}.md`);
+                
+                if (fs.existsSync(commentFile)) {
+                  const commentContent = fs.readFileSync(commentFile, 'utf8');
+                  fullComment += commentContent + '\n\n';
+                  
+                  // Check for changes or errors
+                  if (commentContent.includes('**Status:** changes')) {
+                    hasChanges = true;
+                  }
+                  if (commentContent.includes('**Status:** error')) {
+                    hasErrors = true;
+                  }
+                }
+              }
+            } catch (error) {
+              console.log('Error reading plan artifacts:', error);
+              fullComment += '⚠️ *Could not load plan details*\n\n';
+            }
+            
+            // Add summary
+            fullComment += `## 📊 Summary\n\n`;
+            if (hasErrors) {
+              fullComment += `❌ **Some plans failed** - Please review and fix errors before merging.\n\n`;
+            } else if (hasChanges) {
+              fullComment += `⚠️ **Infrastructure changes detected** - Please review carefully before merging.\n\n`;
+            } else {
+              fullComment += `✅ **No infrastructure changes** - Safe to merge from Terraform perspective.\n\n`;
+            }
+            
+            fullComment += `### 🔗 Useful Links\n`;
+            fullComment += `- [Workflow Run](${context.payload.repository.html_url}/actions/runs/${context.runId})\n`;
+            fullComment += `- [Plan Artifacts](${context.payload.repository.html_url}/actions/runs/${context.runId})\n\n`;
+            
+            fullComment += `---\n*🤖 This comment is automatically updated when you push new commits.*`;
+            
+            // Find existing bot comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ github.event.number }}
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('🔄 Terraform Plan Results')
+            );
+            
+            if (existingComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: fullComment
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ github.event.number }},
+                body: fullComment
+              });
+            }
+
+  #=============================================================================
+  # PR Status Check
+  #=============================================================================
+  pr-status:
+    name: 🎯 PR Status Check
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform-plan]
+    if: always()
+    
+    steps:
+      - name: 🎯 Set PR Status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const needsDetection = '${{ needs.detect-changes.result }}';
+            const terraformPlan = '${{ needs.terraform-plan.result }}';
+            const hasInfraChanges = '${{ needs.detect-changes.outputs.has_infrastructure_changes }}';
+            
+            let state = 'success';
+            let description = 'All checks passed';
+            
+            // Determine status based on job results
+            if (needsDetection === 'failure') {
+              state = 'error';
+              description = 'Failed to detect changes';
+            } else if (hasInfraChanges === 'true') {
+              if (terraformPlan === 'failure') {
+                state = 'failure';
+                description = 'Terraform plan failed';
+              } else if (terraformPlan === 'success') {
+                state = 'success';
+                description = 'Terraform plans completed successfully';
+              } else {
+                state = 'pending';
+                description = 'Terraform plan in progress';
+              }
+            } else {
+              state = 'success';
+              description = 'No infrastructure changes detected';
+            }
+            
+            // Create status check
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.sha }}',
+              state: state,
+              context: 'Terraform Plan',
+              description: description,
+              target_url: `${context.payload.repository.html_url}/actions/runs/${context.runId}`
+            });
+
+  #=============================================================================
+  # Auto-approve for minor changes (optional)
+  #=============================================================================
+  auto-approve:
+    name: 🤖 Auto-approve
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform-plan]
+    if: |
+      always() && 
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      (needs.detect-changes.outputs.has_infrastructure_changes == 'false' && 
+       needs.terraform-plan.result == 'success')
+    
+    steps:
+      - name: 🤖 Auto-approve PR
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Only auto-approve if it's safe
+            const hasInfraChanges = '${{ needs.detect-changes.outputs.has_infrastructure_changes }}';
+            const prAuthor = '${{ github.event.pull_request.user.login }}';
+            
+            let shouldApprove = false;
+            let reason = '';
+            
+            if (prAuthor === 'dependabot[bot]') {
+              shouldApprove = true;
+              reason = 'Dependabot PR with no infrastructure changes';
+            } else if (hasInfraChanges === 'false') {
+              shouldApprove = true;
+              reason = 'No infrastructure changes detected';
+            }
+            
+            if (shouldApprove) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: ${{ github.event.number }},
+                event: 'APPROVE',
+                body: `🤖 **Auto-approved**: ${reason}\n\nThis PR has been automatically approved because it contains no infrastructure changes or is from a trusted bot.`
+              });
+              
+              console.log(`✅ PR auto-approved: ${reason}`);
+            } else {
+              console.log('❌ PR not eligible for auto-approval');
+            }
