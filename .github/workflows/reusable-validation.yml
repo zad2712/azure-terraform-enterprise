@@ -1,0 +1,411 @@
+name: 🔍 Terraform Validation
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.6.0'
+      
+      tflint_version:
+        description: 'TFLint version to use'
+        required: false
+        type: string
+        default: '0.48.0'
+      
+      checkov_version:
+        description: 'Checkov version to use'
+        required: false
+        type: string
+        default: '3.0.0'
+      
+      run_cost_estimation:
+        description: 'Whether to run cost estimation'
+        required: false
+        type: boolean
+        default: false
+    
+    secrets:
+      infracost_api_key:
+        description: 'Infracost API key for cost estimation'
+        required: false
+    
+    outputs:
+      validation_status:
+        description: 'Overall validation status'
+        value: ${{ jobs.validate-summary.outputs.validation_status }}
+
+jobs:
+  #=============================================================================
+  # Terraform Formatting and Basic Validation
+  #=============================================================================
+  terraform-validate:
+    name: 🔧 Terraform Validation
+    runs-on: ubuntu-latest
+    
+    outputs:
+      format_status: ${{ steps.format.outputs.format_status }}
+      validate_status: ${{ steps.validate.outputs.validate_status }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+      
+      - name: 🎨 Terraform Format Check
+        id: format
+        run: |
+          echo "🎨 Checking Terraform formatting..."
+          
+          if terraform fmt -check -recursive -diff; then
+            echo "✅ All Terraform files are properly formatted!"
+            echo "format_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Terraform files are not properly formatted!"
+            echo "format_status=failed" >> $GITHUB_OUTPUT
+            
+            echo "## 🎨 Formatting Issues" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The following files need formatting:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`diff" >> $GITHUB_STEP_SUMMARY
+            terraform fmt -check -recursive -diff >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run \`terraform fmt -recursive\` to fix formatting issues." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+      
+      - name: 🔍 Terraform Validation (All Layers)
+        id: validate
+        run: |
+          echo "🔍 Validating all Terraform configurations..."
+          
+          FAILED_LAYERS=()
+          SUCCESS_COUNT=0
+          
+          for layer in layers/*/; do
+            layer_name=$(basename "$layer")
+            echo ""
+            echo "🔍 Validating layer: $layer_name"
+            
+            cd "$layer"
+            
+            if terraform init -backend=false > /dev/null 2>&1; then
+              if terraform validate; then
+                echo "✅ $layer_name: Valid"
+                ((SUCCESS_COUNT++))
+              else
+                echo "❌ $layer_name: Invalid"
+                FAILED_LAYERS+=("$layer_name")
+              fi
+            else
+              echo "❌ $layer_name: Init failed"
+              FAILED_LAYERS+=("$layer_name")
+            fi
+            
+            cd - > /dev/null
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔍 Terraform Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**✅ Successful:** $SUCCESS_COUNT layers" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ ${#FAILED_LAYERS[@]} -gt 0 ]]; then
+            echo "**❌ Failed:** ${#FAILED_LAYERS[@]} layers" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Failed layers:" >> $GITHUB_STEP_SUMMARY
+            for failed_layer in "${FAILED_LAYERS[@]}"; do
+              echo "- $failed_layer" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "validate_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "**❌ Failed:** 0 layers" >> $GITHUB_STEP_SUMMARY
+            echo "validate_status=success" >> $GITHUB_OUTPUT
+          fi
+
+  #=============================================================================
+  # TFLint Static Analysis
+  #=============================================================================
+  tflint:
+    name: 🔎 TFLint Analysis
+    runs-on: ubuntu-latest
+    
+    outputs:
+      lint_status: ${{ steps.lint.outputs.lint_status }}
+      issues_count: ${{ steps.lint.outputs.issues_count }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ inputs.tflint_version }}
+      
+      - name: 📋 TFLint Configuration
+        run: |
+          cat > .tflint.hcl << 'EOF'
+          config {
+            call_module_type = "all"
+            force = false
+            disabled_by_default = false
+          }
+          
+          plugin "terraform" {
+            enabled = true
+            preset  = "recommended"
+          }
+          
+          plugin "azurerm" {
+            enabled = true
+            version = "0.24.0"
+            source  = "github.com/terraform-linters/tflint-ruleset-azurerm"
+          }
+          
+          rule "terraform_required_version" { enabled = true }
+          rule "terraform_required_providers" { enabled = true }
+          rule "terraform_naming_convention" { enabled = true; format = "snake_case" }
+          rule "terraform_typed_variables" { enabled = true }
+          rule "terraform_unused_declarations" { enabled = true }
+          rule "terraform_comment_syntax" { enabled = true }
+          rule "terraform_documented_outputs" { enabled = true }
+          rule "terraform_documented_variables" { enabled = true }
+          EOF
+      
+      - name: 🔧 Initialize TFLint
+        run: tflint --init
+      
+      - name: 🔎 Run TFLint Analysis
+        id: lint
+        run: |
+          echo "🔎 Running TFLint analysis on all layers..."
+          
+          TOTAL_ISSUES=0
+          LAYER_RESULTS=()
+          
+          for layer in layers/*/; do
+            layer_name=$(basename "$layer")
+            echo ""
+            echo "🔎 Analyzing layer: $layer_name"
+            
+            cd "$layer"
+            
+            if tflint_output=$(tflint --format=json 2>&1); then
+              issues_count=$(echo "$tflint_output" | jq '.issues | length' 2>/dev/null || echo "0")
+              TOTAL_ISSUES=$((TOTAL_ISSUES + issues_count))
+              
+              if [[ $issues_count -eq 0 ]]; then
+                LAYER_RESULTS+=("✅ $layer_name: No issues")
+              else
+                LAYER_RESULTS+=("⚠️ $layer_name: $issues_count issues")
+                echo "$tflint_output" | jq -r '.issues[] | "  - \(.rule.name): \(.message)"' || true
+              fi
+            else
+              LAYER_RESULTS+=("❌ $layer_name: Analysis failed")
+              echo "TFLint failed for $layer_name"
+            fi
+            
+            cd - > /dev/null
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔎 TFLint Analysis Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Issues Found:** $TOTAL_ISSUES" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for result in "${LAYER_RESULTS[@]}"; do
+            echo "- $result" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "issues_count=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
+          
+          if [[ $TOTAL_ISSUES -gt 50 ]]; then
+            echo "lint_status=failed" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Too many issues found ($TOTAL_ISSUES).** Please review and fix." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "lint_status=success" >> $GITHUB_OUTPUT
+          fi
+
+  #=============================================================================
+  # Checkov Security Scanning
+  #=============================================================================
+  checkov:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-latest
+    
+    outputs:
+      security_status: ${{ steps.security.outputs.security_status }}
+      failed_checks: ${{ steps.security.outputs.failed_checks }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: 🛡️ Install Checkov
+        run: pip install checkov==${{ inputs.checkov_version }}
+      
+      - name: 🛡️ Run Security Scan
+        id: security
+        run: |
+          echo "🛡️ Running Checkov security analysis..."
+          
+          checkov \
+            --directory . \
+            --framework terraform \
+            --output json \
+            --output cli \
+            --soft-fail \
+            --download-external-modules true \
+            --output-file-path console,checkov-report.json
+          
+          if [[ -f checkov-report.json ]]; then
+            PASSED=$(jq '.results.passed_checks | length' checkov-report.json)
+            FAILED=$(jq '.results.failed_checks | length' checkov-report.json)
+            SKIPPED=$(jq '.results.skipped_checks | length' checkov-report.json)
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🛡️ Security Scan Results (Checkov)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **✅ Passed:** $PASSED checks" >> $GITHUB_STEP_SUMMARY
+            echo "- **❌ Failed:** $FAILED checks" >> $GITHUB_STEP_SUMMARY
+            echo "- **⏭️ Skipped:** $SKIPPED checks" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "failed_checks=$FAILED" >> $GITHUB_OUTPUT
+            
+            if [[ $FAILED -gt 0 ]]; then
+              echo "### Critical Security Issues" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              jq -r '.results.failed_checks[] | select(.severity == "HIGH" or .severity == "CRITICAL") | "- **\(.check_id)**: \(.check_name) (\(.file_path))"' checkov-report.json | head -20 >> $GITHUB_STEP_SUMMARY
+              
+              CRITICAL_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "HIGH" or .severity == "CRITICAL")] | length' checkov-report.json)
+              
+              if [[ $CRITICAL_COUNT -gt 10 ]]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "⚠️ **Warning:** High number of critical security issues detected!" >> $GITHUB_STEP_SUMMARY
+                echo "security_status=failed" >> $GITHUB_OUTPUT
+              else
+                echo "security_status=warning" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "security_status=success" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Checkov report not generated"
+            echo "security_status=error" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+      
+      - name: 📄 Upload Security Report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: checkov-security-report
+          path: checkov-report.json
+          retention-days: 30
+
+  #=============================================================================
+  # Cost Estimation (Optional)
+  #=============================================================================
+  cost-estimation:
+    name: 💰 Cost Estimation
+    runs-on: ubuntu-latest
+    if: inputs.run_cost_estimation && secrets.infracost_api_key != null
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 💰 Infracost Setup
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.infracost_api_key }}
+      
+      - name: 💰 Generate Cost Estimate
+        run: |
+          echo "💰 Generating cost estimates for infrastructure..."
+          
+          if infracost breakdown --path=. --format=json --out-file=infracost-base.json; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 💰 Cost Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Infrastructure cost estimation completed successfully." >> $GITHUB_STEP_SUMMARY
+            echo "See the Infracost report for detailed breakdown." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 💰 Cost Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Cost estimation failed. Please check the configuration." >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+  #=============================================================================
+  # Validation Summary
+  #=============================================================================
+  validate-summary:
+    name: 📋 Validation Summary
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, tflint, checkov]
+    if: always()
+    
+    outputs:
+      validation_status: ${{ steps.summary.outputs.validation_status }}
+    
+    steps:
+      - name: 📋 Quality Gate Results
+        id: summary
+        run: |
+          echo "## 🎯 Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Validation | ${{ needs.terraform-validate.outputs.validate_status == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Formatting | ${{ needs.terraform-validate.outputs.format_status == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TFLint Analysis | ${{ needs.tflint.outputs.lint_status == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ contains(fromJson('["success", "warning"]'), needs.checkov.outputs.security_status) && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Determine overall status
+          VALIDATION_FAILED=false
+          
+          if [[ "${{ needs.terraform-validate.outputs.validate_status }}" != "success" ]]; then
+            VALIDATION_FAILED=true
+          fi
+          
+          if [[ "${{ needs.terraform-validate.outputs.format_status }}" != "success" ]]; then
+            VALIDATION_FAILED=true
+          fi
+          
+          if [[ "${{ needs.tflint.outputs.lint_status }}" != "success" ]]; then
+            VALIDATION_FAILED=true
+          fi
+          
+          if [[ "${{ needs.checkov.outputs.security_status }}" == "failed" ]]; then
+            VALIDATION_FAILED=true
+          fi
+          
+          if [[ "$VALIDATION_FAILED" == "true" ]]; then
+            echo "🎉 **Some validation checks failed.** Please review and fix the issues before deploying." >> $GITHUB_STEP_SUMMARY
+            echo "validation_status=failed" >> $GITHUB_OUTPUT
+          else
+            echo "🎉 **All validation checks passed!** The code is ready for deployment." >> $GITHUB_STEP_SUMMARY
+            echo "validation_status=success" >> $GITHUB_OUTPUT
+          fi

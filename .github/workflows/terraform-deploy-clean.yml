@@ -1,0 +1,189 @@
+name: 🚀 Terraform Deploy (Clean Version)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, qa, uat, prod]
+        default: dev
+      
+      layer:
+        description: 'Infrastructure layer to deploy'
+        required: true
+        type: choice
+        options: [networking, security, storage, database, compute, monitoring, all]
+        default: networking
+      
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      
+      auto_approve:
+        description: 'Auto-approve apply (use with caution)'
+        required: false
+        type: boolean
+        default: false
+  
+  push:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/**', '.github/actions/**']
+  
+  pull_request:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/**', '.github/actions/**']
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  #=============================================================================
+  # Change Detection & Matrix Setup
+  #=============================================================================
+  setup:
+    name: 🔧 Setup Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      deploy_count: ${{ steps.matrix.outputs.deploy_count }}
+      changed_layers: ${{ steps.changes.outputs.changed_layers }}
+    
+    steps:
+      - name: 🔍 Detect Changes
+        id: changes
+        uses: ./.github/actions/change-detection
+        with:
+          base_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+          head_ref: ${{ github.sha }}
+      
+      - name: 🔧 Setup Matrix
+        id: matrix
+        run: |
+          # Determine environments to deploy
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENVIRONMENTS='["${{ github.event.inputs.environment }}"]'
+          else
+            # For automatic deployments, only deploy to dev
+            ENVIRONMENTS='["dev"]'
+          fi
+          
+          # Determine layers to deploy
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.layer }}" == "all" ]]; then
+              LAYERS='["networking", "security", "storage", "database", "compute", "monitoring"]'
+            else
+              LAYERS='["${{ github.event.inputs.layer }}"]'
+            fi
+          else
+            LAYERS='${{ steps.changes.outputs.changed_layers }}'
+          fi
+          
+          # Create matrix combinations
+          MATRIX=$(jq -n \
+            --argjson envs "$ENVIRONMENTS" \
+            --argjson layers "$LAYERS" \
+            '{include: [foreach $envs[] as $env ({}; foreach $layers[] as $layer ({}; {environment: $env, layer: $layer}))] | map(select(.))}'
+          )
+          
+          DEPLOY_COUNT=$(echo "$MATRIX" | jq '.include | length')
+          
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "deploy_count=$DEPLOY_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "## 🔧 Deployment Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "**Environments:** $ENVIRONMENTS" >> $GITHUB_STEP_SUMMARY
+          echo "**Layers:** $LAYERS" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Deployments:** $DEPLOY_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "```json" >> $GITHUB_STEP_SUMMARY
+          echo "$MATRIX" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+  #=============================================================================
+  # Terraform Operations with Proper Dependencies
+  #=============================================================================
+  terraform-deploy:
+    name: 🏗️ ${{ matrix.layer }} (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.deploy_count != '0'
+    
+    strategy:
+      fail-fast: false
+      max-parallel: 2  # Limit parallel deployments to avoid conflicts
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    
+    steps:
+      - name: 🏗️ Execute Terraform Operation
+        uses: ./.github/actions/terraform-operation
+        with:
+          layer: ${{ matrix.layer }}
+          environment: ${{ matrix.environment }}
+          operation: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action || 'plan' }}
+          terraform_version: ${{ env.TF_VERSION }}
+          auto_approve: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.auto_approve || 'false' }}
+          azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: 💾 Upload Plan Artifacts
+        if: (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan') || github.event_name != 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ matrix.layer }}-${{ matrix.environment }}
+          path: |
+            layers/${{ matrix.layer }}/tfplan
+            layers/${{ matrix.layer }}/.terraform.lock.hcl
+          retention-days: 30
+
+  #=============================================================================
+  # Summary & Reporting
+  #=============================================================================
+  summary:
+    name: 📊 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [setup, terraform-deploy]
+    if: always()
+    
+    steps:
+      - name: 📊 Generate Summary
+        run: |
+          echo "## 🚀 Terraform Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "### 🎯 Manual Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Layer:** ${{ github.event.inputs.layer }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Auto Approve:** ${{ github.event.inputs.auto_approve }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 🤖 Automatic Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "- **Changed Layers:** ${{ needs.setup.outputs.changed_layers }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Target Environment:** dev (automatic)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📈 Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Setup:** ${{ needs.setup.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Terraform Deploy:** ${{ needs.terraform-deploy.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Deployments:** ${{ needs.setup.outputs.deploy_count }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.terraform-deploy.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the individual job logs for details." >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.terraform-deploy.result }}" == "success" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ Deployment Completed Successfully" >> $GITHUB_STEP_SUMMARY
+            echo "All infrastructure operations completed without errors." >> $GITHUB_STEP_SUMMARY
+          fi

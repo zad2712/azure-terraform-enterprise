@@ -1,50 +1,27 @@
-#===============================================================================
-# Terraform Multi-Layer Deployment Pipeline
-# 
-# This workflow deploys the enterprise Azure infrastructure across multiple layers
-# and environments following the dependency chain:
-# networking -> security -> storage -> database -> compute -> monitoring
-#===============================================================================
-
 name: 🚀 Terraform Deploy
 
 on:
-  # Manual workflow dispatch with environment and layer selection
   workflow_dispatch:
     inputs:
       environment:
         description: 'Target environment'
         required: true
         type: choice
-        options:
-          - dev
-          - qa
-          - uat
-          - prod
+        options: [dev, qa, uat, prod]
         default: dev
       
       layer:
         description: 'Infrastructure layer to deploy'
         required: true
         type: choice
-        options:
-          - networking
-          - security
-          - storage
-          - database
-          - compute
-          - monitoring
-          - all
+        options: [networking, security, storage, database, compute, monitoring, all]
         default: networking
       
       action:
         description: 'Terraform action to perform'
         required: true
         type: choice
-        options:
-          - plan
-          - apply
-          - destroy
+        options: [plan, apply, destroy]
         default: plan
       
       auto_approve:
@@ -53,221 +30,62 @@ on:
         type: boolean
         default: false
   
-  # Automatic deployment on push to main (dev environment only)
   push:
     branches: [main]
-    paths:
-      - 'layers/**'
-      - 'modules/**'
-      - '.github/workflows/terraform-deploy.yml'
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy.yml']
   
-  # Plan on pull requests
   pull_request:
     branches: [main]
-    paths:
-      - 'layers/**'
-      - 'modules/**'
-      - '.github/workflows/terraform-deploy.yml'
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy.yml']
 
-# Global environment variables
 env:
   TF_VERSION: '1.6.0'
-  TF_LOG: INFO
-  ARM_USE_MSI: false
-  ARM_USE_CLI: false
 
 jobs:
   #=============================================================================
-  # Setup and Validation Job
+  # Change Detection
   #=============================================================================
-  setup:
-    name: 🔍 Setup & Validation
-    runs-on: ubuntu-latest
-    outputs:
-      environment: ${{ steps.setup.outputs.environment }}
-      layers: ${{ steps.setup.outputs.layers }}
-      changed_layers: ${{ steps.detect-changes.outputs.changed_layers }}
-      deployment_matrix: ${{ steps.setup.outputs.deployment_matrix }}
-    
-    steps:
-      - name: 📥 Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: 🔧 Setup Environment Variables
-        id: setup
-        run: |
-          # Determine environment
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ENV="${{ github.event.inputs.environment }}"
-            LAYER="${{ github.event.inputs.layer }}"
-            ACTION="${{ github.event.inputs.action }}"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            ENV="dev"
-            LAYER="all"
-            ACTION="plan"
-          else # pull_request
-            ENV="dev"
-            LAYER="all"
-            ACTION="plan"
-          fi
-          
-          echo "environment=${ENV}" >> $GITHUB_OUTPUT
-          echo "action=${ACTION}" >> $GITHUB_OUTPUT
-          
-          # Define layer deployment order
-          if [[ "${LAYER}" == "all" ]]; then
-            LAYERS='["networking", "security", "storage", "database", "compute", "monitoring"]'
-          else
-            LAYERS='["'${LAYER}'"]'
-          fi
-          
-          echo "layers=${LAYERS}" >> $GITHUB_OUTPUT
-          
-          # Create deployment matrix
-          MATRIX=$(echo ${LAYERS} | jq -c "{layer: ., environment: [\"${ENV}\"]}")
-          echo "deployment_matrix=${MATRIX}" >> $GITHUB_OUTPUT
-          
-          echo "🎯 Target Environment: ${ENV}"
-          echo "🏗️ Layers to deploy: ${LAYERS}"
-          echo "⚡ Action: ${ACTION}"
-      
-      - name: 🔍 Detect Changed Layers
-        id: detect-changes
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            # Get changed files between base and head
-            CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }})
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            # Get changed files in the last commit
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
-          else
-            # Manual dispatch - consider all layers changed
-            CHANGED_FILES="layers/"
-          fi
-          
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
-          
-          # Determine which layers are affected
-          CHANGED_LAYERS=()
-          for layer in networking security storage database compute monitoring; do
-            if echo "$CHANGED_FILES" | grep -q "layers/${layer}/\|modules/"; then
-              CHANGED_LAYERS+=("\"${layer}\"")
-            fi
-          done
-          
-          # If modules changed, consider all layers affected
-          if echo "$CHANGED_FILES" | grep -q "modules/"; then
-            CHANGED_LAYERS=("\"networking\"" "\"security\"" "\"storage\"" "\"database\"" "\"compute\"" "\"monitoring\"")
-          fi
-          
-          CHANGED_LAYERS_JSON=$(IFS=,; echo "[${CHANGED_LAYERS[*]}]")
-          echo "changed_layers=${CHANGED_LAYERS_JSON}" >> $GITHUB_OUTPUT
-          echo "🔍 Changed layers: ${CHANGED_LAYERS_JSON}"
+  detect-changes:
+    name: 🔍 Detect Changes
+    uses: ./.github/workflows/reusable-change-detection.yml
+    with:
+      base_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+      head_ref: ${{ github.sha }}
 
   #=============================================================================
-  # Terraform Plan Job (runs for all events)
+  # Setup Deployment Matrix
+  #=============================================================================
+  setup-matrix:
+    name: 🔧 Setup Matrix
+    uses: ./.github/workflows/reusable-matrix-setup.yml
+    needs: detect-changes
+    with:
+      environments: ${{ github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.environment) || '["dev"]' }}
+      layers: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' && '"all"' || format('["{0}"]', github.event.inputs.layer)) || needs.detect-changes.outputs.changed_layers }}
+      filter_existing_configs: true
+
+  #=============================================================================
+  # Terraform Plan Job
   #=============================================================================
   terraform-plan:
-    name: 📋 Plan (${{ matrix.layer }}-${{ matrix.environment }})
-    runs-on: ubuntu-latest
-    needs: setup
-    if: always() && !cancelled() && !failure()
+    name: 📋 Plan
+    needs: [detect-changes, setup-matrix]
+    if: always() && !cancelled() && !failure() && needs.setup-matrix.outputs.combinations_count != '0'
     
     strategy:
-      matrix: 
-        layer: ${{ fromJson(needs.setup.outputs.layers) }}
-        environment: [dev] # Will be overridden by setup output
-      max-parallel: 1 # Deploy layers sequentially
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 1
       fail-fast: false
     
-    env:
-      TF_WORKSPACE: ${{ matrix.layer }}-${{ needs.setup.outputs.environment }}
-      TF_VAR_environment: ${{ needs.setup.outputs.environment }}
-    
-    steps:
-      - name: 📥 Checkout Code
-        uses: actions/checkout@v4
-      
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-      
-      - name: 🔑 Azure Login
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      
-      - name: 🏗️ Terraform Init
-        working-directory: layers/${{ matrix.layer }}
-        run: |
-          echo "🔄 Initializing Terraform for ${{ matrix.layer }}/${{ needs.setup.outputs.environment }}..."
-          
-          # Check if backend config exists
-          if [[ ! -f "environments/${{ needs.setup.outputs.environment }}/backend.conf" ]]; then
-            echo "❌ Backend configuration not found: environments/${{ needs.setup.outputs.environment }}/backend.conf"
-            exit 1
-          fi
-          
-          # Replace placeholder in backend.conf if needed
-          if grep -q "<STORAGE_ACCOUNT_NAME>" environments/${{ needs.setup.outputs.environment }}/backend.conf; then
-            echo "⚠️ Backend configuration contains placeholder. Please update backend.conf with actual storage account name."
-            exit 1
-          fi
-          
-          terraform init -backend-config=environments/${{ needs.setup.outputs.environment }}/backend.conf
-      
-      - name: 🔍 Terraform Validate
-        working-directory: layers/${{ matrix.layer }}
-        run: |
-          echo "✅ Validating Terraform configuration..."
-          terraform validate
-      
-      - name: 📋 Terraform Plan
-        working-directory: layers/${{ matrix.layer }}
-        run: |
-          echo "📋 Creating Terraform plan for ${{ matrix.layer }}/${{ needs.setup.outputs.environment }}..."
-          
-          # Check if tfvars file exists
-          if [[ ! -f "environments/${{ needs.setup.outputs.environment }}/terraform.tfvars" ]]; then
-            echo "❌ Variables file not found: environments/${{ needs.setup.outputs.environment }}/terraform.tfvars"
-            exit 1
-          fi
-          
-          terraform plan \
-            -var-file=environments/${{ needs.setup.outputs.environment }}/terraform.tfvars \
-            -out=tfplan-${{ needs.setup.outputs.environment }} \
-            -detailed-exitcode
-        continue-on-error: true
-        id: plan
-      
-      - name: 📊 Plan Summary
-        working-directory: layers/${{ matrix.layer }}
-        run: |
-          echo "## 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Layer:** ${{ matrix.layer }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Environment:** ${{ needs.setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ${{ steps.plan.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [[ -f tfplan-${{ needs.setup.outputs.environment }} ]]; then
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            terraform show -no-color tfplan-${{ needs.setup.outputs.environment }} | head -50 >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
-      
-      - name: 💾 Upload Plan Artifact
-        uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: tfplan-${{ matrix.layer }}-${{ needs.setup.outputs.environment }}
-          path: layers/${{ matrix.layer }}/tfplan-${{ needs.setup.outputs.environment }}
-          retention-days: 30
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: ${{ matrix.layer }}
+      environment: ${{ matrix.environment }}
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+      plan_artifact_name: pr${{ github.event.number || 'main' }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
 
   #=============================================================================
   # Terraform Apply Job (only on workflow_dispatch with apply action)

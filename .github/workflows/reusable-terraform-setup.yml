@@ -1,0 +1,65 @@
+#===============================================================================
+# Reusable Workflow: Terraform Setup
+# 
+# Sets up the common Terraform environment including checkout, Terraform CLI,
+# and Azure authentication. Used by all Terraform workflows.
+#===============================================================================
+
+name: 🔧 Terraform Setup
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: 'Terraform version to install'
+        required: false
+        type: string
+        default: '1.6.0'
+      
+      working_directory:
+        description: 'Working directory for Terraform operations'
+        required: false
+        type: string
+        default: '.'
+      
+      checkout_fetch_depth:
+        description: 'Number of commits to fetch'
+        required: false
+        type: number
+        default: 1
+    
+    secrets:
+      azure_credentials:
+        description: 'Azure service principal credentials'
+        required: true
+
+jobs:
+  setup:
+    name: 🔧 Setup Environment
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.checkout_fetch_depth }}
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.azure_credentials }}
+      
+      - name: ✅ Verify Setup
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          echo "🔍 Verifying setup..."
+          echo "Terraform version: $(terraform version)"
+          echo "Azure CLI version: $(az --version | head -n1)"
+          echo "Current user: $(az account show --query user.name -o tsv)"
+          echo "✅ Setup completed successfully!"

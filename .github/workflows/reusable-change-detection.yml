@@ -1,0 +1,164 @@
+name: 🔍 Change Detection
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        description: 'Base reference for comparison'
+        required: false
+        type: string
+        default: ''
+      
+      head_ref:
+        description: 'Head reference for comparison'
+        required: false
+        type: string
+        default: ''
+    
+    outputs:
+      changed_layers:
+        description: 'JSON array of changed layers'
+        value: ${{ jobs.detect-changes.outputs.changed_layers }}
+      
+      changed_modules:
+        description: 'JSON array of changed modules'
+        value: ${{ jobs.detect-changes.outputs.changed_modules }}
+      
+      has_infrastructure_changes:
+        description: 'Whether infrastructure changes were detected'
+        value: ${{ jobs.detect-changes.outputs.has_infrastructure_changes }}
+      
+      deployment_matrix:
+        description: 'Matrix for deployment jobs'
+        value: ${{ jobs.detect-changes.outputs.deployment_matrix }}
+
+jobs:
+  detect-changes:
+    name: 🔍 Detect Changes
+    runs-on: ubuntu-latest
+    
+    outputs:
+      changed_layers: ${{ steps.changes.outputs.changed_layers }}
+      changed_modules: ${{ steps.changes.outputs.changed_modules }}
+      has_infrastructure_changes: ${{ steps.changes.outputs.has_infrastructure_changes }}
+      deployment_matrix: ${{ steps.changes.outputs.deployment_matrix }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🔍 Analyze Changes
+        id: changes
+        run: |
+          echo "🔍 Analyzing changes..."
+          
+          # Determine comparison refs
+          if [[ -n "${{ inputs.base_ref }}" && -n "${{ inputs.head_ref }}" ]]; then
+            BASE_REF="${{ inputs.base_ref }}"
+            HEAD_REF="${{ inputs.head_ref }}"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            HEAD_REF="${{ github.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            BASE_REF="HEAD~1"
+            HEAD_REF="HEAD"
+          else
+            # Manual dispatch - consider all layers changed
+            echo "Manual trigger detected - considering all layers changed"
+            ALL_LAYERS='["networking", "security", "storage", "database", "compute", "monitoring"]'
+            echo "changed_layers=${ALL_LAYERS}" >> $GITHUB_OUTPUT
+            echo "changed_modules=[]" >> $GITHUB_OUTPUT
+            echo "has_infrastructure_changes=true" >> $GITHUB_OUTPUT
+            
+            DEPLOYMENT_MATRIX=$(echo "$ALL_LAYERS" | jq '{include: [.[] | {layer: ., environment: "dev"}]}')
+            echo "deployment_matrix=${DEPLOYMENT_MATRIX}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "📄 Comparing: $BASE_REF...$HEAD_REF"
+          
+          # Get changed files
+          CHANGED_FILES=$(git diff --name-only "$BASE_REF"..."$HEAD_REF")
+          
+          echo "📄 Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Initialize arrays
+          CHANGED_LAYERS=()
+          CHANGED_MODULES=()
+          HAS_INFRA_CHANGES=false
+          
+          # Analyze changed files
+          while IFS= read -r file; do
+            if [[ -z "$file" ]]; then
+              continue
+            fi
+            
+            # Check for layer changes
+            if [[ $file == layers/* ]]; then
+              layer=$(echo "$file" | cut -d'/' -f2)
+              if [[ ! " ${CHANGED_LAYERS[@]} " =~ " ${layer} " ]]; then
+                CHANGED_LAYERS+=("\"$layer\"")
+              fi
+              HAS_INFRA_CHANGES=true
+            fi
+            
+            # Check for module changes
+            if [[ $file == modules/* ]]; then
+              module=$(echo "$file" | cut -d'/' -f2)
+              if [[ ! " ${CHANGED_MODULES[@]} " =~ " ${module} " ]]; then
+                CHANGED_MODULES+=("\"$module\"")
+              fi
+              HAS_INFRA_CHANGES=true
+            fi
+            
+            # Check for workflow changes
+            if [[ $file == .github/workflows/* ]]; then
+              echo "🔧 Workflow changes detected: $file"
+            fi
+          done <<< "$CHANGED_FILES"
+          
+          # If modules changed, all layers are potentially affected
+          if [[ ${#CHANGED_MODULES[@]} -gt 0 ]]; then
+            echo "📦 Module changes detected - all layers potentially affected"
+            CHANGED_LAYERS=("\"networking\"" "\"security\"" "\"storage\"" "\"database\"" "\"compute\"" "\"monitoring\"")
+          fi
+          
+          # Convert to JSON arrays
+          CHANGED_LAYERS_JSON="[$(IFS=,; echo "${CHANGED_LAYERS[*]}")]"
+          CHANGED_MODULES_JSON="[$(IFS=,; echo "${CHANGED_MODULES[*]}")]"
+          
+          echo "changed_layers=${CHANGED_LAYERS_JSON}" >> $GITHUB_OUTPUT
+          echo "changed_modules=${CHANGED_MODULES_JSON}" >> $GITHUB_OUTPUT
+          echo "has_infrastructure_changes=${HAS_INFRA_CHANGES}" >> $GITHUB_OUTPUT
+          
+          # Create deployment matrix for dev environment
+          DEPLOYMENT_MATRIX='{"include":[]}'
+          if [[ ${#CHANGED_LAYERS[@]} -gt 0 ]]; then
+            DEPLOYMENT_MATRIX=$(echo "$CHANGED_LAYERS_JSON" | jq '{include: [.[] | {layer: ., environment: "dev"}]}')
+          fi
+          echo "deployment_matrix=${DEPLOYMENT_MATRIX}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "🎯 Analysis Results:"
+          echo "  Changed Layers: ${CHANGED_LAYERS_JSON}"
+          echo "  Changed Modules: ${CHANGED_MODULES_JSON}"
+          echo "  Has Infrastructure Changes: ${HAS_INFRA_CHANGES}"
+          echo "  Deployment Matrix: ${DEPLOYMENT_MATRIX}"
+      
+      - name: 📊 Change Summary
+        run: |
+          echo "## 🔍 Change Detection Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Changed Layers:** ${{ steps.changes.outputs.changed_layers }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Changed Modules:** ${{ steps.changes.outputs.changed_modules }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Infrastructure Changes:** ${{ steps.changes.outputs.has_infrastructure_changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.changes.outputs.has_infrastructure_changes }}" == "true" ]]; then
+            echo "⚠️ **Infrastructure changes detected** - Terraform operations will be triggered" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **No infrastructure changes** - Skipping Terraform operations" >> $GITHUB_STEP_SUMMARY
+          fi

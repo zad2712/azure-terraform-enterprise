@@ -1,0 +1,195 @@
+name: 🏗️ Terraform Operation
+description: 'Composite action for Terraform operations with Azure backend'
+
+inputs:
+  layer:
+    description: 'Infrastructure layer (networking, security, storage, database, compute, monitoring)'
+    required: true
+  
+  environment:
+    description: 'Target environment (dev, qa, uat, prod)'
+    required: true
+  
+  operation:
+    description: 'Terraform operation (init, plan, apply, destroy)'
+    required: true
+    default: 'plan'
+  
+  terraform_version:
+    description: 'Terraform version to use'
+    required: false
+    default: '1.6.0'
+  
+  auto_approve:
+    description: 'Auto-approve applies (use with caution)'
+    required: false
+    default: 'false'
+  
+  working_directory:
+    description: 'Working directory for Terraform operations'
+    required: false
+    default: '.'
+  
+  azure_credentials:
+    description: 'Azure service principal credentials'
+    required: true
+
+outputs:
+  plan_output:
+    description: 'Terraform plan output'
+    value: ${{ steps.plan.outputs.stdout }}
+  
+  apply_output:
+    description: 'Terraform apply output'  
+    value: ${{ steps.apply.outputs.stdout }}
+  
+  changes_detected:
+    description: 'Whether changes were detected in plan'
+    value: ${{ steps.plan.outputs.exitcode == '2' }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 🔍 Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: 🔧 Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+    
+    - name: 🔐 Configure Azure CLI
+      uses: azure/login@v1
+      with:
+        creds: ${{ inputs.azure_credentials }}
+    
+    - name: 📂 Set Working Directory
+      shell: bash
+      run: |
+        LAYER_PATH="${{ inputs.working_directory }}/layers/${{ inputs.layer }}"
+        if [[ ! -d "$LAYER_PATH" ]]; then
+          echo "❌ Layer directory not found: $LAYER_PATH"
+          exit 1
+        fi
+        echo "LAYER_PATH=$LAYER_PATH" >> $GITHUB_ENV
+        echo "✅ Working directory set: $LAYER_PATH"
+    
+    - name: 📝 Generate Backend Configuration
+      shell: bash
+      run: |
+        BACKEND_CONFIG="${{ inputs.layer }}-${{ inputs.environment }}.hcl"
+        
+        cat > "$BACKEND_CONFIG" << EOF
+        resource_group_name  = "tfstate-${{ inputs.environment }}"
+        storage_account_name = "tfstate${{ inputs.environment }}$(echo '${{ github.repository }}' | sed 's/[^a-z0-9]//g' | cut -c1-8)"
+        container_name       = "tfstate"
+        key                  = "${{ inputs.layer }}/${{ inputs.environment }}/terraform.tfstate"
+        EOF
+        
+        echo "Backend configuration created:"
+        cat "$BACKEND_CONFIG"
+        echo "BACKEND_CONFIG=$BACKEND_CONFIG" >> $GITHUB_ENV
+    
+    - name: 🚀 Terraform Init
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      run: |
+        echo "Initializing Terraform in $(pwd)"
+        terraform init \
+          -backend-config="../../../${{ env.BACKEND_CONFIG }}" \
+          -upgrade \
+          -no-color
+    
+    - name: 🔍 Terraform Validate
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      run: |
+        terraform validate -no-color
+    
+    - name: 📋 Terraform Plan
+      id: plan
+      if: inputs.operation == 'plan' || inputs.operation == 'apply'
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      continue-on-error: true
+      run: |
+        # Check if environment-specific tfvars file exists
+        TFVARS_FILE=""
+        if [[ -f "environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars" ]]; then
+          TFVARS_FILE="-var-file=environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars"
+        elif [[ -f "../../environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars" ]]; then
+          TFVARS_FILE="-var-file=../../environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars"
+        fi
+        
+        echo "Running terraform plan with tfvars: $TFVARS_FILE"
+        
+        terraform plan \
+          $TFVARS_FILE \
+          -input=false \
+          -no-color \
+          -detailed-exitcode \
+          -out=tfplan
+    
+    - name: 📊 Plan Summary
+      if: steps.plan.outcome != 'skipped'
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      run: |
+        echo "## 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "**Layer:** ${{ inputs.layer }}" >> $GITHUB_STEP_SUMMARY  
+        echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ ${{ steps.plan.outputs.exitcode }} -eq 0 ]]; then
+          echo "✅ **No changes detected**" >> $GITHUB_STEP_SUMMARY
+        elif [[ ${{ steps.plan.outputs.exitcode }} -eq 2 ]]; then
+          echo "📝 **Changes detected - review required**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan | head -50 >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Plan failed**" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: 🚀 Terraform Apply
+      id: apply
+      if: inputs.operation == 'apply' && (inputs.auto_approve == 'true' || github.event_name == 'workflow_dispatch')
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      run: |
+        if [[ ${{ steps.plan.outputs.exitcode }} -eq 2 ]]; then
+          echo "Applying Terraform changes..."
+          terraform apply -input=false -no-color tfplan
+          echo "✅ Apply completed successfully"
+        else
+          echo "ℹ️ No changes to apply"
+        fi
+    
+    - name: 💥 Terraform Destroy
+      if: inputs.operation == 'destroy' && inputs.auto_approve == 'true'
+      shell: bash
+      working-directory: ${{ env.LAYER_PATH }}
+      run: |
+        # Check if environment-specific tfvars file exists
+        TFVARS_FILE=""
+        if [[ -f "environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars" ]]; then
+          TFVARS_FILE="-var-file=environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars"
+        elif [[ -f "../../environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars" ]]; then
+          TFVARS_FILE="-var-file=../../environments/${{ inputs.environment }}/${{ inputs.layer }}.tfvars"
+        fi
+        
+        echo "🚨 DESTROYING infrastructure for ${{ inputs.layer }}/${{ inputs.environment }}"
+        terraform destroy \
+          $TFVARS_FILE \
+          -input=false \
+          -no-color \
+          -auto-approve
+    
+    - name: 🧹 Cleanup
+      if: always()
+      shell: bash
+      run: |
+        # Clean up temporary files
+        rm -f "${{ env.BACKEND_CONFIG }}"
+        echo "✅ Cleanup completed"

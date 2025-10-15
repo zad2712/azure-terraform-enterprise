@@ -1,0 +1,303 @@
+name: 🚀 Terraform Operations
+
+on:
+  workflow_call:
+    inputs:
+      layer:
+        description: 'Infrastructure layer to operate on'
+        required: true
+        type: string
+      
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      
+      operation:
+        description: 'Terraform operation to perform'
+        required: true
+        type: string
+        # plan, apply, destroy, validate-only
+      
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.6.0'
+      
+      auto_approve:
+        description: 'Auto-approve apply operations'
+        required: false
+        type: boolean
+        default: false
+      
+      plan_artifact_name:
+        description: 'Name for plan artifact'
+        required: false
+        type: string
+        default: ''
+    
+    outputs:
+      plan_status:
+        description: 'Status of plan operation (success, changes, error, no-vars)'
+        value: ${{ jobs.terraform-operation.outputs.plan_status }}
+      
+      operation_status:
+        description: 'Overall operation status'
+        value: ${{ jobs.terraform-operation.outputs.operation_status }}
+    
+    secrets:
+      azure_credentials:
+        description: 'Azure service principal credentials'
+        required: true
+
+env:
+  TF_LOG: INFO
+  TF_VAR_environment: ${{ inputs.environment }}
+
+jobs:
+  terraform-operation:
+    name: 🚀 ${{ inputs.operation }} (${{ inputs.layer }}-${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    
+    outputs:
+      plan_status: ${{ steps.plan.outputs.plan_status }}
+      operation_status: ${{ steps.operation.outputs.operation_status }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      
+      - name: 🔑 Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.azure_credentials }}
+      
+      - name: 🏗️ Terraform Init
+        id: init
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "🔄 Initializing Terraform for ${{ inputs.layer }}/${{ inputs.environment }}..."
+          
+          # Check if backend config exists
+          if [[ ! -f "environments/${{ inputs.environment }}/backend.conf" ]]; then
+            echo "⚠️ Backend configuration not found: environments/${{ inputs.environment }}/backend.conf"
+            if [[ "${{ inputs.operation }}" == "validate-only" ]]; then
+              echo "Initializing without backend for validation only..."
+              terraform init -backend=false
+              echo "init_status=no-backend" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Backend configuration required for ${{ inputs.operation }}"
+              exit 1
+            fi
+          else
+            # Check for placeholders
+            if grep -q "<STORAGE_ACCOUNT_NAME>" environments/${{ inputs.environment }}/backend.conf; then
+              echo "⚠️ Backend configuration contains placeholder"
+              if [[ "${{ inputs.operation }}" == "validate-only" ]]; then
+                echo "Initializing without backend for validation only..."
+                terraform init -backend=false
+                echo "init_status=no-backend" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Please update backend.conf with actual storage account name"
+                exit 1
+              fi
+            else
+              terraform init -backend-config=environments/${{ inputs.environment }}/backend.conf
+              echo "init_status=success" >> $GITHUB_OUTPUT
+            fi
+          fi
+      
+      - name: 🔍 Terraform Validate
+        if: always() && steps.init.conclusion == 'success'
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "✅ Validating Terraform configuration..."
+          terraform validate
+      
+      - name: 📋 Terraform Plan
+        id: plan
+        if: contains(fromJson('["plan", "apply"]'), inputs.operation)
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "📋 Creating Terraform plan for ${{ inputs.layer }}/${{ inputs.environment }}..."
+          
+          # Check if tfvars file exists
+          if [[ ! -f "environments/${{ inputs.environment }}/terraform.tfvars" ]]; then
+            echo "⚠️ Variables file not found: environments/${{ inputs.environment }}/terraform.tfvars"
+            echo "plan_status=no-vars" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Generate plan file name
+          PLAN_FILE="tfplan-${{ inputs.environment }}"
+          if [[ -n "${{ inputs.plan_artifact_name }}" ]]; then
+            PLAN_FILE="tfplan-${{ inputs.plan_artifact_name }}"
+          fi
+          
+          # Create plan
+          terraform plan \
+            -var-file=environments/${{ inputs.environment }}/terraform.tfvars \
+            -out="$PLAN_FILE" \
+            -detailed-exitcode \
+            > plan-output.txt 2>&1
+          
+          PLAN_EXIT_CODE=$?
+          
+          # Exit codes: 0 = no changes, 1 = error, 2 = changes detected
+          case $PLAN_EXIT_CODE in
+            0)
+              echo "plan_status=success" >> $GITHUB_OUTPUT
+              echo "✅ No changes detected"
+              ;;
+            1)
+              echo "plan_status=error" >> $GITHUB_OUTPUT
+              echo "❌ Plan failed"
+              cat plan-output.txt
+              exit 1
+              ;;
+            2)
+              echo "plan_status=changes" >> $GITHUB_OUTPUT
+              echo "⚠️ Changes detected"
+              
+              # Extract change counts
+              ADD_COUNT=$(grep -o "to add" plan-output.txt | wc -l || echo "0")
+              CHANGE_COUNT=$(grep -o "to change" plan-output.txt | wc -l || echo "0")
+              DESTROY_COUNT=$(grep -o "to destroy" plan-output.txt | wc -l || echo "0")
+              
+              echo "📊 Changes Summary:"
+              echo "  - To Add: $ADD_COUNT resources"
+              echo "  - To Change: $CHANGE_COUNT resources"
+              echo "  - To Destroy: $DESTROY_COUNT resources"
+              ;;
+          esac
+        continue-on-error: true
+      
+      - name: 🚀 Terraform Apply
+        id: apply
+        if: inputs.operation == 'apply' && steps.plan.outputs.plan_status != 'error'
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "🚀 Applying Terraform plan for ${{ inputs.layer }}/${{ inputs.environment }}..."
+          
+          # Generate plan file name
+          PLAN_FILE="tfplan-${{ inputs.environment }}"
+          if [[ -n "${{ inputs.plan_artifact_name }}" ]]; then
+            PLAN_FILE="tfplan-${{ inputs.plan_artifact_name }}"
+          fi
+          
+          if [[ "${{ inputs.auto_approve }}" == "true" ]]; then
+            echo "⚡ Auto-approve enabled"
+            if [[ -f "$PLAN_FILE" ]]; then
+              terraform apply "$PLAN_FILE"
+            else
+              terraform apply -auto-approve -var-file=environments/${{ inputs.environment }}/terraform.tfvars
+            fi
+          else
+            if [[ -f "$PLAN_FILE" ]]; then
+              terraform apply "$PLAN_FILE"
+            else
+              echo "❌ Plan file not found: $PLAN_FILE"
+              exit 1
+            fi
+          fi
+      
+      - name: 💥 Terraform Destroy
+        id: destroy
+        if: inputs.operation == 'destroy'
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "💥 Destroying infrastructure for ${{ inputs.layer }}/${{ inputs.environment }}..."
+          
+          # Check if tfvars file exists
+          if [[ ! -f "environments/${{ inputs.environment }}/terraform.tfvars" ]]; then
+            echo "❌ Variables file not found: environments/${{ inputs.environment }}/terraform.tfvars"
+            exit 1
+          fi
+          
+          terraform destroy \
+            -var-file=environments/${{ inputs.environment }}/terraform.tfvars \
+            -auto-approve
+      
+      - name: 📋 Terraform Outputs
+        if: contains(fromJson('["apply"]'), inputs.operation) && steps.apply.conclusion == 'success'
+        working-directory: layers/${{ inputs.layer }}
+        run: |
+          echo "📋 Terraform Outputs:"
+          terraform output -json > outputs.json || echo "{}" > outputs.json
+          
+          # Display outputs in summary
+          echo "## 📋 Terraform Outputs (${{ inputs.layer }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat outputs.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📊 Operation Summary
+        id: operation
+        if: always()
+        run: |
+          echo "## 🚀 Operation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Layer:** ${{ inputs.layer }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Operation:** ${{ inputs.operation }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Determine overall status
+          if [[ "${{ steps.init.conclusion }}" != "success" ]]; then
+            echo "operation_status=init-failed" >> $GITHUB_OUTPUT
+            echo "**Status:** ❌ Initialization Failed" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ inputs.operation }}" == "validate-only" ]]; then
+            echo "operation_status=validated" >> $GITHUB_OUTPUT
+            echo "**Status:** ✅ Validation Successful" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ inputs.operation }}" == "plan" ]]; then
+            echo "operation_status=${{ steps.plan.outputs.plan_status }}" >> $GITHUB_OUTPUT
+            case "${{ steps.plan.outputs.plan_status }}" in
+              "success")
+                echo "**Status:** ✅ Plan Successful (No Changes)" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "changes")
+                echo "**Status:** ⚠️ Plan Successful (Changes Detected)" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "error")
+                echo "**Status:** ❌ Plan Failed" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "no-vars")
+                echo "**Status:** ⏭️ Skipped (No Variables File)" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+          elif [[ "${{ inputs.operation }}" == "apply" ]]; then
+            if [[ "${{ steps.apply.conclusion }}" == "success" ]]; then
+              echo "operation_status=applied" >> $GITHUB_OUTPUT
+              echo "**Status:** ✅ Apply Successful" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "operation_status=apply-failed" >> $GITHUB_OUTPUT
+              echo "**Status:** ❌ Apply Failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [[ "${{ inputs.operation }}" == "destroy" ]]; then
+            if [[ "${{ steps.destroy.conclusion }}" == "success" ]]; then
+              echo "operation_status=destroyed" >> $GITHUB_OUTPUT
+              echo "**Status:** ✅ Destroy Successful" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "operation_status=destroy-failed" >> $GITHUB_OUTPUT
+              echo "**Status:** ❌ Destroy Failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+      
+      - name: 💾 Upload Plan Artifacts
+        uses: actions/upload-artifact@v3
+        if: always() && contains(fromJson('["plan", "apply"]'), inputs.operation)
+        with:
+          name: ${{ inputs.plan_artifact_name || format('plan-{0}-{1}', inputs.layer, inputs.environment) }}
+          path: |
+            layers/${{ inputs.layer }}/tfplan-*
+            layers/${{ inputs.layer }}/plan-output.txt
+            layers/${{ inputs.layer }}/outputs.json
+          retention-days: 30

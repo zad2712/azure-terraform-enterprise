@@ -1,0 +1,126 @@
+name: 🔧 Matrix Setup
+
+on:
+  workflow_call:
+    inputs:
+      environments:
+        description: 'Environments to include (JSON array or "all")'
+        required: false
+        type: string
+        default: '["dev"]'
+      
+      layers:
+        description: 'Layers to include (JSON array or "all")'
+        required: false
+        type: string
+        default: '["networking"]'
+      
+      filter_existing_configs:
+        description: 'Only include combinations with existing tfvars files'
+        required: false
+        type: boolean
+        default: true
+    
+    outputs:
+      matrix:
+        description: 'Generated matrix for strategy'
+        value: ${{ jobs.setup-matrix.outputs.matrix }}
+      
+      combinations_count:
+        description: 'Number of valid combinations found'
+        value: ${{ jobs.setup-matrix.outputs.combinations_count }}
+
+jobs:
+  setup-matrix:
+    name: 🔧 Setup Matrix
+    runs-on: ubuntu-latest
+    
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      combinations_count: ${{ steps.matrix.outputs.combinations_count }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Generate Matrix
+        id: matrix
+        run: |
+          echo "🔧 Generating matrix..."
+          
+          # Parse input environments
+          if [[ "${{ inputs.environments }}" == "all" ]]; then
+            ENVIRONMENTS=("dev" "qa" "uat" "prod")
+          else
+            ENVIRONMENTS=($(echo '${{ inputs.environments }}' | jq -r '.[]'))
+          fi
+          
+          # Parse input layers
+          if [[ "${{ inputs.layers }}" == "all" ]]; then
+            LAYERS=("networking" "security" "storage" "database" "compute" "monitoring")
+          else
+            LAYERS=($(echo '${{ inputs.layers }}' | jq -r '.[]'))
+          fi
+          
+          echo "🎯 Target environments: ${ENVIRONMENTS[@]}"
+          echo "🏗️ Target layers: ${LAYERS[@]}"
+          
+          # Generate matrix combinations
+          MATRIX_INCLUDE=()
+          VALID_COMBINATIONS=0
+          
+          for env in "${ENVIRONMENTS[@]}"; do
+            for layer in "${LAYERS[@]}"; do
+              # Check if combination should be included
+              INCLUDE_COMBINATION=true
+              
+              if [[ "${{ inputs.filter_existing_configs }}" == "true" ]]; then
+                # Check if tfvars file exists
+                if [[ ! -f "layers/${layer}/environments/${env}/terraform.tfvars" ]]; then
+                  echo "⏭️ Skipping ${layer}/${env} - no terraform.tfvars file"
+                  INCLUDE_COMBINATION=false
+                fi
+              fi
+              
+              if [[ "$INCLUDE_COMBINATION" == "true" ]]; then
+                MATRIX_INCLUDE+=("{\"environment\":\"${env}\",\"layer\":\"${layer}\"}")
+                ((VALID_COMBINATIONS++))
+                echo "✅ Including ${layer}/${env}"
+              fi
+            done
+          done
+          
+          # Format as JSON array
+          if [[ ${#MATRIX_INCLUDE[@]} -eq 0 ]]; then
+            MATRIX_JSON='{"include":[]}'
+            echo "⚠️ No valid combinations found"
+          else
+            MATRIX_JSON="[$(IFS=,; echo "${MATRIX_INCLUDE[*]}")]"
+            MATRIX_JSON='{"include":'${MATRIX_JSON}'}'
+          fi
+          
+          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+          echo "combinations_count=${VALID_COMBINATIONS}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "📋 Generated matrix (${VALID_COMBINATIONS} combinations):"
+          echo "$MATRIX_JSON" | jq '.'
+      
+      - name: 📊 Matrix Summary
+        run: |
+          echo "## 🔧 Matrix Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Valid Combinations:** ${{ steps.matrix.outputs.combinations_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Filter Existing Configs:** ${{ inputs.filter_existing_configs }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.matrix.outputs.combinations_count }}" -eq "0" ]]; then
+            echo "⚠️ **No valid combinations found.** Check that:" >> $GITHUB_STEP_SUMMARY
+            echo "- Target environments exist in layer configurations" >> $GITHUB_STEP_SUMMARY
+            echo "- terraform.tfvars files are present (if filtering enabled)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Matrix Details" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            echo '${{ steps.matrix.outputs.matrix }}' | jq '.' >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi

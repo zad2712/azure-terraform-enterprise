@@ -1,0 +1,206 @@
+name: 🚀 Terraform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, qa, uat, prod]
+        default: dev
+      
+      layer:
+        description: 'Infrastructure layer to deploy'
+        required: true
+        type: choice
+        options: [networking, security, storage, database, compute, monitoring, all]
+        default: networking
+      
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      
+      auto_approve:
+        description: 'Auto-approve apply (use with caution)'
+        required: false
+        type: boolean
+        default: false
+  
+  push:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy.yml']
+  
+  pull_request:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy.yml']
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  #=============================================================================
+  # Change Detection
+  #=============================================================================
+  detect-changes:
+    name: 🔍 Detect Changes
+    uses: ./.github/workflows/reusable-change-detection.yml
+    with:
+      base_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+      head_ref: ${{ github.sha }}
+
+  #=============================================================================
+  # Setup Deployment Matrix
+  #=============================================================================
+  setup-matrix:
+    name: 🔧 Setup Matrix
+    uses: ./.github/workflows/reusable-matrix-setup.yml
+    needs: detect-changes
+    with:
+      environments: ${{ github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.environment) || '["dev"]' }}
+      layers: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' && '"all"' || format('["{0}"]', github.event.inputs.layer)) || needs.detect-changes.outputs.changed_layers }}
+      filter_existing_configs: true
+
+  #=============================================================================
+  # Terraform Plan Job
+  #=============================================================================
+  terraform-plan:
+    name: 📋 Plan (${{ matrix.layer }}-${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: [detect-changes, setup-matrix]
+    if: always() && !cancelled() && !failure() && needs.setup-matrix.outputs.combinations_count != '0'
+    
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 1
+      fail-fast: false
+    
+    steps:
+      - name: 🚀 Run Terraform Operation
+        uses: ./.github/workflows/reusable-terraform-operation.yml
+        with:
+          layer: ${{ matrix.layer }}
+          environment: ${{ matrix.environment }}
+          operation: plan
+          terraform_version: '1.6.0'
+          plan_artifact_name: pr${{ github.event.number || 'main' }}
+        secrets:
+          azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  #=============================================================================
+  # Terraform Apply Job (manual deployments only)
+  #=============================================================================
+  terraform-apply:
+    name: 🚀 Apply (${{ matrix.layer }}-${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: [setup-matrix, terraform-plan]
+    if: |
+      always() && 
+      !cancelled() && 
+      !failure() && 
+      github.event_name == 'workflow_dispatch' && 
+      github.event.inputs.action == 'apply' &&
+      needs.setup-matrix.outputs.combinations_count != '0'
+    
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 1
+      fail-fast: true
+    
+    environment: 
+      name: ${{ matrix.environment }}
+      url: https://portal.azure.com
+    
+    steps:
+      - name: 🚀 Run Terraform Operation
+        uses: ./.github/workflows/reusable-terraform-operation.yml
+        with:
+          layer: ${{ matrix.layer }}
+          environment: ${{ matrix.environment }}
+          operation: apply
+          terraform_version: '1.6.0'
+          auto_approve: ${{ github.event.inputs.auto_approve == 'true' }}
+          plan_artifact_name: pr${{ github.event.number || 'main' }}
+        secrets:
+          azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  #=============================================================================
+  # Terraform Destroy Job (manual destroy only)
+  #=============================================================================
+  terraform-destroy:
+    name: 💥 Destroy (${{ matrix.layer }}-${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: setup-matrix
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      github.event.inputs.action == 'destroy' &&
+      needs.setup-matrix.outputs.combinations_count != '0'
+    
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 1
+      fail-fast: false
+    
+    environment: 
+      name: ${{ matrix.environment }}-destroy
+      url: https://portal.azure.com
+    
+    steps:
+      - name: 🚀 Run Terraform Operation
+        uses: ./.github/workflows/reusable-terraform-operation.yml
+        with:
+          layer: ${{ matrix.layer }}
+          environment: ${{ matrix.environment }}
+          operation: destroy
+          terraform_version: '1.6.0'
+          auto_approve: true
+        secrets:
+          azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  #=============================================================================
+  # Deployment Summary
+  #=============================================================================
+  summary:
+    name: 📋 Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, setup-matrix, terraform-plan, terraform-apply, terraform-destroy]
+    if: always()
+    
+    steps:
+      - name: 📊 Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Job status summary
+          echo "### Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "- Change Detection: ${{ needs.detect-changes.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Matrix Setup: ${{ needs.setup-matrix.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Plan: ${{ needs.terraform-plan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Apply: ${{ needs.terraform-apply.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Destroy: ${{ needs.terraform-destroy.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Configuration summary
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "### Manual Deployment Configuration" >> $GITHUB_STEP_SUMMARY
+            echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Layer:** ${{ github.event.inputs.layer }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Auto Approve:** ${{ github.event.inputs.auto_approve }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Automatic Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "- **Changed Layers:** ${{ needs.detect-changes.outputs.changed_layers }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Infrastructure Changes:** ${{ needs.detect-changes.outputs.has_infrastructure_changes }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Valid Combinations:** ${{ needs.setup-matrix.outputs.combinations_count }}" >> $GITHUB_STEP_SUMMARY

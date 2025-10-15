@@ -1,0 +1,104 @@
+name: 🔍 Change Detection
+description: 'Composite action to detect changes in Terraform layers and modules'
+
+inputs:
+  base_ref:
+    description: 'Base Git reference for comparison'
+    required: true
+    default: 'HEAD~1'
+  
+  head_ref:
+    description: 'Head Git reference for comparison'
+    required: true
+    default: 'HEAD'
+  
+  layers_path:
+    description: 'Path to layers directory'
+    required: false
+    default: 'layers'
+  
+  modules_path:
+    description: 'Path to modules directory'
+    required: false
+    default: 'modules'
+
+outputs:
+  changed_layers:
+    description: 'JSON array of changed layers'
+    value: ${{ steps.detect.outputs.changed_layers }}
+  
+  changed_modules:
+    description: 'JSON array of changed modules'
+    value: ${{ steps.detect.outputs.changed_modules }}
+  
+  has_changes:
+    description: 'Boolean indicating if any changes were detected'
+    value: ${{ steps.detect.outputs.has_changes }}
+  
+  all_layers:
+    description: 'JSON array of all available layers'
+    value: ${{ steps.detect.outputs.all_layers }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 🔍 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: 🔍 Detect Changes
+      id: detect
+      shell: bash
+      run: |
+        echo "Detecting changes between ${{ inputs.base_ref }} and ${{ inputs.head_ref }}"
+        
+        # Get list of changed files
+        CHANGED_FILES=$(git diff --name-only ${{ inputs.base_ref }}..${{ inputs.head_ref }} || echo "")
+        
+        if [[ -z "$CHANGED_FILES" ]]; then
+          echo "No changes detected"
+          echo "changed_layers=[]" >> $GITHUB_OUTPUT
+          echo "changed_modules=[]" >> $GITHUB_OUTPUT
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Detect changed layers
+          CHANGED_LAYERS=$(echo "$CHANGED_FILES" | grep "^${{ inputs.layers_path }}/" | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n")[:-1]' || echo "[]")
+          
+          # Detect changed modules  
+          CHANGED_MODULES=$(echo "$CHANGED_FILES" | grep "^${{ inputs.modules_path }}/" | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n")[:-1]' || echo "[]")
+          
+          # Check if workflow files changed (triggers all layers)
+          WORKFLOW_CHANGED=$(echo "$CHANGED_FILES" | grep -E "\.github/workflows|\.github/actions" | wc -l)
+          
+          if [[ $WORKFLOW_CHANGED -gt 0 ]]; then
+            echo "Workflow files changed - deploying all layers"
+            CHANGED_LAYERS='["networking", "security", "storage", "database", "compute", "monitoring"]'
+          fi
+          
+          # If modules changed, deploy layers that depend on them
+          if [[ "$CHANGED_MODULES" != "[]" ]]; then
+            echo "Modules changed - triggering dependent layers"
+            CHANGED_LAYERS='["networking", "security", "storage", "database", "compute", "monitoring"]'
+          fi
+          
+          echo "changed_layers=$CHANGED_LAYERS" >> $GITHUB_OUTPUT
+          echo "changed_modules=$CHANGED_MODULES" >> $GITHUB_OUTPUT
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+        fi
+        
+        # Get all available layers
+        ALL_LAYERS='[]'
+        if [[ -d "${{ inputs.layers_path }}" ]]; then
+          ALL_LAYERS=$(find "${{ inputs.layers_path }}" -maxdepth 1 -type d ! -name "$(basename "${{ inputs.layers_path }}")" -exec basename {} \; | jq -R -s -c 'split("\n")[:-1]')
+        fi
+        
+        echo "all_layers=$ALL_LAYERS" >> $GITHUB_OUTPUT
+        
+        echo "## 🔍 Change Detection Results" >> $GITHUB_STEP_SUMMARY
+        echo "**Changed Layers:** $CHANGED_LAYERS" >> $GITHUB_STEP_SUMMARY
+        echo "**Changed Modules:** $CHANGED_MODULES" >> $GITHUB_STEP_SUMMARY
+        echo "**All Layers:** $ALL_LAYERS" >> $GITHUB_STEP_SUMMARY

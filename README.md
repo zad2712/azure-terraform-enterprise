@@ -36,6 +36,18 @@ terraform-azure-enterprise/
 │   ├── troubleshooting.md             # Common issues (436 lines)
 │   └── PROJECT_STRUCTURE.md           # Complete structure reference
 │
+├── .github/                           # GitHub Actions CI/CD
+│   ├── workflows/                     # Automated deployment workflows
+│   │   ├── terraform-deploy-clean.yml # Main deployment pipeline (refactored)
+│   │   ├── terraform-validate.yml     # Code quality validation
+│   │   ├── terraform-drift-detection.yml # Infrastructure drift monitoring
+│   │   ├── terraform-pr-automation.yml # PR automation & validation
+│   │   └── terraform-backend-setup.yml # Azure backend management
+│   ├── actions/                       # Reusable composite actions
+│   │   ├── terraform-operation/       # Core Terraform operations
+│   │   └── change-detection/          # Intelligent change detection
+│   └── copilot-instructions.md        # AI assistant guidance
+│
 ├── scripts/                           # Automation and helper scripts
 │   ├── generate-backend-configs.sh    # Generate all backend.conf files
 │   ├── setup-backend.sh               # Initialize Azure backend storage

@@ -1,0 +1,198 @@
+name: 🚀 Terraform Deploy (Refactored)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, qa, uat, prod]
+        default: dev
+      
+      layer:
+        description: 'Infrastructure layer to deploy'
+        required: true
+        type: choice
+        options: [networking, security, storage, database, compute, monitoring, all]
+        default: networking
+      
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      
+      auto_approve:
+        description: 'Auto-approve apply (use with caution)'
+        required: false
+        type: boolean
+        default: false
+  
+  push:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy-refactored.yml']
+  
+  pull_request:
+    branches: [main]
+    paths: ['layers/**', 'modules/**', '.github/workflows/terraform-deploy-refactored.yml']
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  #=============================================================================
+  # Change Detection
+  #=============================================================================
+  detect-changes:
+    name: 🔍 Detect Changes
+    uses: ./.github/workflows/reusable-change-detection.yml
+    with:
+      base_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+      head_ref: ${{ github.sha }}
+
+  #=============================================================================
+  # Setup Deployment Matrix
+  #=============================================================================
+  setup-matrix:
+    name: 🔧 Setup Matrix
+    uses: ./.github/workflows/reusable-matrix-setup.yml
+    needs: detect-changes
+    with:
+      environments: ${{ github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.environment) || '["dev"]' }}
+      layers: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' && '"all"' || format('["{0}"]', github.event.inputs.layer)) || needs.detect-changes.outputs.changed_layers }}
+      filter_existing_configs: true
+
+  #=============================================================================
+  # Generate Individual Jobs for Each Layer/Environment
+  #=============================================================================
+  generate-jobs:
+    name: 📋 Generate Jobs
+    runs-on: ubuntu-latest
+    needs: [setup-matrix]
+    if: needs.setup-matrix.outputs.combinations_count != '0'
+    outputs:
+      job_list: ${{ steps.generate.outputs.job_list }}
+    
+    steps:
+      - name: 📋 Generate Job List
+        id: generate
+        run: |
+          # Parse matrix and create individual job identifiers
+          MATRIX='${{ needs.setup-matrix.outputs.matrix }}'
+          echo "Matrix: $MATRIX"
+          
+          JOB_LIST=$(echo "$MATRIX" | jq -r '.include[] | "\(.layer)-\(.environment)"' | jq -R -s -c 'split("\n")[:-1]')
+          echo "job_list=$JOB_LIST" >> $GITHUB_OUTPUT
+          echo "Generated jobs: $JOB_LIST"
+
+  #=============================================================================
+  # Plan Jobs (Individual jobs for each layer/environment)
+  #=============================================================================
+  plan-networking-dev:
+    name: 📋 Plan (networking-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'networking-dev')
+    needs: [setup-matrix, generate-jobs]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: networking
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  plan-security-dev:
+    name: 📋 Plan (security-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'security-dev')
+    needs: [setup-matrix, generate-jobs, plan-networking-dev]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: security
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  plan-storage-dev:
+    name: 📋 Plan (storage-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'storage-dev')
+    needs: [setup-matrix, generate-jobs, plan-security-dev]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: storage
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  plan-database-dev:
+    name: 📋 Plan (database-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'database-dev')
+    needs: [setup-matrix, generate-jobs, plan-security-dev]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: database
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  plan-compute-dev:
+    name: 📋 Plan (compute-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'compute-dev')
+    needs: [setup-matrix, generate-jobs, plan-security-dev]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: compute
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  plan-monitoring-dev:
+    name: 📋 Plan (monitoring-dev)
+    if: contains(needs.generate-jobs.outputs.job_list, 'monitoring-dev')
+    needs: [setup-matrix, generate-jobs, plan-security-dev]
+    uses: ./.github/workflows/reusable-terraform-operation.yml
+    with:
+      layer: monitoring
+      environment: dev
+      operation: plan
+      terraform_version: ${{ env.TF_VERSION }}
+    secrets:
+      azure_credentials: ${{ secrets.AZURE_CREDENTIALS }}
+
+  #=============================================================================
+  # Summary Job
+  #=============================================================================
+  summary:
+    name: 📋 Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, setup-matrix, plan-networking-dev, plan-security-dev, plan-storage-dev, plan-database-dev, plan-compute-dev, plan-monitoring-dev]
+    if: always()
+    
+    steps:
+      - name: 📊 Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "### Manual Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Layer:** ${{ github.event.inputs.layer }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Automatic Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "- **Changed Layers:** ${{ needs.detect-changes.outputs.changed_layers }}" >> $GITHUB_STEP_SUMMARY
+          fi
