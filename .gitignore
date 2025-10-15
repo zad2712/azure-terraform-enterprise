@@ -1,0 +1,86 @@
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars.backup
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Sensitive files
+**/.env
+**/.env.local
+**/secrets.tf
+**/secrets.tfvars
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Module cache
+.terraform.d/
+
+# Testing
+.kitchen/
+.kitchen.local.yml
+test/fixtures/
+inspec.lock
+
+# Python (if using Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+ENV/
+
+# Node (if using Node tools)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Keep example tfvars templates
+!terraform.tfvars.example
+!*.example
+
+# Keep documentation
+!README.md
+!*.md
